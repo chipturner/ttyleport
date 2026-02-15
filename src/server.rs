@@ -28,25 +28,26 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
     let master: OwnedFd = pty.master;
     let slave: OwnedFd = pty.slave;
 
-    // Spawn shell on slave PTY
+    // Spawn shell on slave PTY — dup the fd for each stdio stream
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let slave_fd = slave.as_raw_fd();
+    let (stdin_fd, stdout_fd, stderr_fd) = unsafe {
+        (libc::dup(slave_fd), libc::dup(slave_fd), libc::dup(slave_fd))
+    };
+    drop(slave); // close original, child uses the dups
 
     let mut child = unsafe {
         Command::new(&shell)
             .pre_exec(move || {
                 nix::unistd::setsid().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+                libc::ioctl(stdin_fd, libc::TIOCSCTTY, 0);
                 Ok(())
             })
-            .stdin(Stdio::from_raw_fd(slave.as_raw_fd()))
-            .stdout(Stdio::from_raw_fd(slave.as_raw_fd()))
-            .stderr(Stdio::from_raw_fd(slave.as_raw_fd()))
+            .stdin(Stdio::from_raw_fd(stdin_fd))
+            .stdout(Stdio::from_raw_fd(stdout_fd))
+            .stderr(Stdio::from_raw_fd(stderr_fd))
             .spawn()?
     };
-
-    // Close slave in parent — child owns it now
-    drop(slave);
 
     // Set master to non-blocking for AsyncFd
     let raw_master = master.as_raw_fd();
