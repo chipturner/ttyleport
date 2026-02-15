@@ -26,7 +26,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { socket } => todo!("serve on {}", socket.display()),
+        Command::Serve { socket } => ttyleport::server::run(&socket).await,
         Command::Connect { socket } => todo!("connect to {}", socket.display()),
     }
 }

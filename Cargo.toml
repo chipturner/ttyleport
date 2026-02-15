@@ -15,7 +15,7 @@ path = "src/main.rs"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
 libc = "0.2"
 nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }
 tokio = { version = "1", features = ["full"] }
