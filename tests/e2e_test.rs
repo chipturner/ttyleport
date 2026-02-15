@@ -6,41 +6,121 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use ttyleport::protocol::{Frame, FrameCodec};
 
-#[tokio::test]
-async fn server_spawns_shell_and_relays_output() {
-    let socket_path = std::env::temp_dir().join("ttyleport-test.sock");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server = tokio::spawn(async move {
-        ttyleport::server::run(&path).await
-    });
-
+async fn connect_to_server(socket_path: &std::path::Path) -> Framed<UnixStream, FrameCodec> {
     // Give server time to bind
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let stream = UnixStream::connect(socket_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
 
-    // Send initial resize
+    // Send initial resize (server expects this)
     framed
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
         .unwrap();
 
-    // Should receive shell output (prompt)
-    let frame = timeout(Duration::from_secs(3), framed.next())
-        .await
-        .expect("timed out")
-        .expect("stream ended")
-        .expect("decode error");
-    assert!(matches!(frame, Frame::Data(_)));
+    framed
+}
 
-    // Send exit to cleanly close (best-effort — shell may already have exited)
-    let _ = framed
-        .send(Frame::Data(Bytes::from("exit\n")))
-        .await;
+/// Drain all available Data frames within a timeout, return concatenated bytes.
+async fn read_available_data(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    wait: Duration,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        match timeout(wait, framed.next()).await {
+            Ok(Some(Ok(Frame::Data(data)))) => out.extend_from_slice(&data),
+            _ => break,
+        }
+    }
+    out
+}
 
+#[tokio::test]
+async fn server_spawns_shell_and_relays_output() {
+    let socket_path = std::env::temp_dir().join("ttyleport-test-output.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let path = socket_path.clone();
+    let server = tokio::spawn(async move { ttyleport::server::run(&path).await });
+
+    let mut framed = connect_to_server(&socket_path).await;
+
+    // Should receive some shell output (prompt or motd)
+    let initial = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    assert!(!initial.is_empty(), "expected shell output after connect");
+
+    // Send exit to cleanly close
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[tokio::test]
+async fn server_relays_command_output() {
+    let socket_path = std::env::temp_dir().join("ttyleport-test-echo.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let path = socket_path.clone();
+    let server = tokio::spawn(async move { ttyleport::server::run(&path).await });
+
+    let mut framed = connect_to_server(&socket_path).await;
+
+    // Drain initial prompt
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Send a command whose output we can identify
+    framed
+        .send(Frame::Data(Bytes::from("echo TTYLEPORT_TEST_OK\n")))
+        .await
+        .unwrap();
+
+    // Read output — should contain our marker string
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("TTYLEPORT_TEST_OK"),
+        "expected command output in relay, got: {output_str}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[tokio::test]
+async fn server_sends_exit_frame_on_shell_exit() {
+    let socket_path = std::env::temp_dir().join("ttyleport-test-exit.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let path = socket_path.clone();
+    let _server = tokio::spawn(async move { ttyleport::server::run(&path).await });
+
+    let mut framed = connect_to_server(&socket_path).await;
+
+    // Drain initial prompt
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Tell shell to exit with specific code
+    framed
+        .send(Frame::Data(Bytes::from("exit 42\n")))
+        .await
+        .unwrap();
+
+    // Read until we get an Exit frame or stream ends
+    let mut got_exit = false;
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::Exit { code }))) => {
+                assert_eq!(code, 42, "expected exit code 42, got {code}");
+                got_exit = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue, // skip output
+            _ => break,
+        }
+    }
+    assert!(got_exit, "expected Exit frame from server");
     let _ = std::fs::remove_file(&socket_path);
 }

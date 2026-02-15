@@ -9,6 +9,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::codec::Framed;
+use tracing::{debug, info};
 
 struct RawModeGuard {
     fd: BorrowedFd<'static>,
@@ -39,6 +40,7 @@ fn get_terminal_size() -> (u16, u16) {
 
 pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
     let stream = UnixStream::connect(socket_path).await?;
+    info!(path = %socket_path.display(), "connected");
     let mut framed = Framed::new(stream, FrameCodec);
 
     let stdin = io::stdin();
@@ -69,8 +71,12 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
             ready = async_stdin.readable() => {
                 let mut guard = ready?;
                 match guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
-                    Ok(Ok(0)) => break,
+                    Ok(Ok(0)) => {
+                        debug!("stdin EOF");
+                        break;
+                    }
                     Ok(Ok(n)) => {
+                        debug!(len = n, "stdin → socket");
                         framed.send(Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await?;
                     }
                     Ok(Err(e)) => return Err(e.into()),
@@ -81,10 +87,12 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
             frame = framed.next() => {
                 match frame {
                     Some(Ok(Frame::Data(data))) => {
+                        debug!(len = data.len(), "socket → stdout");
                         io::stdout().write_all(&data)?;
                         io::stdout().flush()?;
                     }
                     Some(Ok(Frame::Exit { code })) => {
+                        info!(code, "server sent exit");
                         exit_code = code;
                         break;
                     }
@@ -96,6 +104,7 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
 
             _ = sigwinch.recv() => {
                 let (cols, rows) = get_terminal_size();
+                debug!(cols, rows, "SIGWINCH → resize");
                 framed.send(Frame::Resize { cols, rows }).await?;
             }
         }

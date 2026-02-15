@@ -10,6 +10,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio_util::codec::Framed;
+use tracing::{debug, info};
 
 pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
     // Clean up stale socket file
@@ -18,10 +19,10 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
     }
 
     let listener = UnixListener::bind(socket_path)?;
-    eprintln!("listening on {}", socket_path.display());
+    info!(path = %socket_path.display(), "listening");
 
     let (stream, _addr) = listener.accept().await?;
-    eprintln!("client connected");
+    info!("client connected");
 
     // Allocate PTY
     let pty = openpty(None, None)?;
@@ -66,10 +67,10 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
             frame = framed.next() => {
                 match frame {
                     Some(Ok(Frame::Data(data))) => {
+                        debug!(len = data.len(), "socket → pty");
                         let mut guard = async_master.writable().await?;
                         match guard.try_io(|inner| {
-                            nix::unistd::write(inner, &data)
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                            nix::unistd::write(inner, &data).map_err(io::Error::from)
                         }) {
                             Ok(Ok(_)) => {}
                             Ok(Err(e)) => return Err(e.into()),
@@ -77,6 +78,7 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
                         }
                     }
                     Some(Ok(Frame::Resize { cols, rows })) => {
+                        debug!(cols, rows, "resize pty");
                         let ws = libc::winsize {
                             ws_row: rows,
                             ws_col: cols,
@@ -99,15 +101,19 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
             ready = async_master.readable() => {
                 let mut guard = ready?;
                 match guard.try_io(|inner| {
-                    nix::unistd::read(inner.as_raw_fd(), &mut buf)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                    nix::unistd::read(inner.as_raw_fd(), &mut buf).map_err(io::Error::from)
                 }) {
-                    Ok(Ok(0)) => break,
+                    Ok(Ok(0)) => {
+                        debug!("pty EOF");
+                        break;
+                    }
                     Ok(Ok(n)) => {
+                        debug!(len = n, "pty → socket");
                         framed.send(Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await?;
                     }
                     Ok(Err(e)) => {
                         if e.raw_os_error() == Some(libc::EIO) {
+                            debug!("pty EIO (shell exited)");
                             break;
                         }
                         return Err(e.into());
@@ -118,6 +124,7 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
 
             status = child.wait() => {
                 let code = status?.code().unwrap_or(1);
+                info!(code, "shell exited");
                 let _ = framed.send(Frame::Exit { code }).await;
                 break;
             }
