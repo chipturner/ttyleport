@@ -27,6 +27,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { socket } => ttyleport::server::run(&socket).await,
-        Command::Connect { socket } => todo!("connect to {}", socket.display()),
+        Command::Connect { socket } => {
+            let code = ttyleport::client::run(&socket).await?;
+            std::process::exit(code);
+        }
     }
 }
