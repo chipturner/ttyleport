@@ -190,10 +190,7 @@ pub async fn run(
                     }) {
                         Ok(Ok(0)) => {
                             debug!("pty EOF");
-                            let code = child.wait().await.ok()
-                                .and_then(|s| s.code()).unwrap_or(0);
-                            let _ = framed.send(Frame::Exit { code }).await;
-                            break RelayExit::ShellExited(code);
+                            break RelayExit::ShellExited(0);
                         }
                         Ok(Ok(n)) => {
                             debug!(len = n, "pty -> socket");
@@ -202,10 +199,7 @@ pub async fn run(
                         Ok(Err(e)) => {
                             if e.raw_os_error() == Some(libc::EIO) {
                                 debug!("pty EIO (shell exited)");
-                                let code = child.wait().await.ok()
-                                    .and_then(|s| s.code()).unwrap_or(0);
-                                let _ = framed.send(Frame::Exit { code }).await;
-                                break RelayExit::ShellExited(code);
+                                break RelayExit::ShellExited(0);
                             }
                             return Err(e.into());
                         }
