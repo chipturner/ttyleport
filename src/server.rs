@@ -225,7 +225,6 @@ pub async fn run(
                 status = managed.child.wait() => {
                     let code = status?.code().unwrap_or(1);
                     info!(code, "shell exited");
-                    let _ = framed.send(Frame::Exit { code }).await;
                     break RelayExit::ShellExited(code);
                 }
             }
@@ -239,7 +238,13 @@ pub async fn run(
                 info!("client disconnected, waiting for reconnect");
                 continue;
             }
-            RelayExit::ShellExited(code) => {
+            RelayExit::ShellExited(mut code) => {
+                // PTY EOF/EIO may fire before child.wait(), giving code=0.
+                // Try to get the real exit code from the child.
+                if let Ok(Some(status)) = managed.child.try_wait() {
+                    code = status.code().unwrap_or(code);
+                }
+                let _ = framed.send(Frame::Exit { code }).await;
                 info!(code, "session ended");
                 break;
             }

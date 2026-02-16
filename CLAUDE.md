@@ -32,6 +32,7 @@ cargo run -- ls                      # list active sessions
 cargo run -- kill-session -t myproject  # kill session
 cargo run -- kill-server             # kill daemon
 RUST_LOG=debug cargo run -- new-session -t test --foreground  # debug mode
+tmux start-server\; source-file quicktest.tmux  # manual 3-pane test (server + socat bridge + client)
 ```
 
 ## Architecture
@@ -60,7 +61,7 @@ Four modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. All modules implemented and tested (27 tests: 18 protocol codec + 5 e2e session + 4 daemon integration).
+Full CLI with tmux-like ergonomics. All modules implemented and tested (28 tests: 18 protocol codec + 6 e2e session + 4 daemon integration).
 
 ## Development Notes
 

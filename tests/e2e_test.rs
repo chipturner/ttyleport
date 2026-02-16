@@ -209,3 +209,60 @@ async fn server_exits_when_shell_dies_while_disconnected() {
     );
     let _ = std::fs::remove_file(&socket_path);
 }
+
+#[tokio::test]
+async fn second_client_detaches_first() {
+    let socket_path = std::env::temp_dir().join("ttyleport-test-takeover.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let path = socket_path.clone();
+    let server = tokio::spawn(async move {
+        ttyleport::server::run(&path, Arc::new(OnceLock::new())).await
+    });
+
+    // First client connects
+    let mut client1 = connect_to_server(&socket_path).await;
+    read_available_data(&mut client1, Duration::from_secs(1)).await;
+
+    // Second client connects — should take over the session
+    let stream2 = UnixStream::connect(&socket_path).await.unwrap();
+    let mut client2 = Framed::new(stream2, FrameCodec);
+    client2
+        .send(Frame::Resize { cols: 80, rows: 24 })
+        .await
+        .unwrap();
+
+    // First client should receive Detached
+    let mut got_detached = false;
+    loop {
+        match timeout(Duration::from_secs(3), client1.next()).await {
+            Ok(Some(Ok(Frame::Detached))) => {
+                got_detached = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            _ => break,
+        }
+    }
+    assert!(got_detached, "first client should receive Detached frame");
+
+    // Second client should be able to interact with the shell
+    read_available_data(&mut client2, Duration::from_secs(1)).await;
+
+    client2
+        .send(Frame::Data(Bytes::from("echo TAKEOVER_OK\n")))
+        .await
+        .unwrap();
+
+    let output = read_available_data(&mut client2, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("TAKEOVER_OK"),
+        "second client should be able to use the session, got: {output_str}"
+    );
+
+    // Clean up
+    let _ = client2.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+    let _ = std::fs::remove_file(&socket_path);
+}

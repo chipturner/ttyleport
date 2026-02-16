@@ -67,13 +67,15 @@ async fn daemon_creates_and_lists_sessions() {
         .await
         .unwrap();
 
-    // Should get shell output
-    let frame = timeout(Duration::from_secs(3), framed.next())
-        .await
-        .expect("timed out")
-        .expect("stream ended")
-        .expect("decode error");
-    assert!(matches!(frame, Frame::Data(_)));
+    // Should get shell output — drain all available data
+    let mut got_data = false;
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::Data(_)))) => { got_data = true; }
+            _ => break,
+        }
+    }
+    assert!(got_data, "expected shell output after connect");
 
     // Clean up: exit the shell
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
