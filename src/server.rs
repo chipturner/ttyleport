@@ -46,7 +46,7 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
         Command::new(&shell)
             .pre_exec(move || {
                 nix::unistd::setsid().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                libc::ioctl(stdin_fd, libc::TIOCSCTTY, 0);
+                libc::ioctl(stdin_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
                 Ok(())
             })
             .stdin(Stdio::from_raw_fd(stdin_fd))
@@ -132,7 +132,10 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
                     }) {
                         Ok(Ok(0)) => {
                             debug!("pty EOF");
-                            break RelayExit::ShellExited(0);
+                            let code = child.wait().await.ok()
+                                .and_then(|s| s.code()).unwrap_or(0);
+                            let _ = framed.send(Frame::Exit { code }).await;
+                            break RelayExit::ShellExited(code);
                         }
                         Ok(Ok(n)) => {
                             debug!(len = n, "pty -> socket");
@@ -141,7 +144,10 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
                         Ok(Err(e)) => {
                             if e.raw_os_error() == Some(libc::EIO) {
                                 debug!("pty EIO (shell exited)");
-                                break RelayExit::ShellExited(0);
+                                let code = child.wait().await.ok()
+                                    .and_then(|s| s.code()).unwrap_or(0);
+                                let _ = framed.send(Frame::Exit { code }).await;
+                                break RelayExit::ShellExited(code);
                             }
                             return Err(e.into());
                         }
