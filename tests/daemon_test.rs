@@ -54,7 +54,7 @@ async fn daemon_creates_and_lists_sessions() {
     match &resp {
         Frame::SessionInfo { sessions } => {
             assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0], session_path.display().to_string());
+            assert_eq!(sessions[0].path, session_path.display().to_string());
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -129,5 +129,97 @@ async fn daemon_rejects_duplicate_session() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let _ = std::fs::remove_file(&ctl_path);
+    let _ = std::fs::remove_file(&session_path);
+}
+
+#[tokio::test]
+async fn daemon_kills_session() {
+    let ctl_path = std::env::temp_dir().join("ttyleport-daemon-test-kill-ctl.sock");
+    let session_path = std::env::temp_dir().join("ttyleport-daemon-test-kill-session.sock");
+    let _ = std::fs::remove_file(&ctl_path);
+    let _ = std::fs::remove_file(&session_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move {
+        ttyleport::daemon::run(&ctl).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Create a session
+    let resp = control_request(
+        &ctl_path,
+        Frame::CreateSession {
+            path: session_path.display().to_string(),
+        },
+    )
+    .await;
+    assert_eq!(resp, Frame::Ok);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Kill it
+    let resp = control_request(
+        &ctl_path,
+        Frame::KillSession {
+            path: session_path.display().to_string(),
+        },
+    )
+    .await;
+    assert_eq!(resp, Frame::Ok);
+
+    // List should be empty
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    match &resp {
+        Frame::SessionInfo { sessions } => {
+            assert!(sessions.is_empty(), "expected no sessions after kill");
+        }
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
+
+    // Socket file should be gone
+    assert!(!session_path.exists(), "session socket should be removed");
+
+    let _ = std::fs::remove_file(&ctl_path);
+}
+
+#[tokio::test]
+async fn daemon_kills_server() {
+    let ctl_path = std::env::temp_dir().join("ttyleport-daemon-test-killsrv-ctl.sock");
+    let session_path = std::env::temp_dir().join("ttyleport-daemon-test-killsrv-session.sock");
+    let _ = std::fs::remove_file(&ctl_path);
+    let _ = std::fs::remove_file(&session_path);
+
+    let ctl = ctl_path.clone();
+    let daemon = tokio::spawn(async move {
+        ttyleport::daemon::run(&ctl).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Create a session
+    let resp = control_request(
+        &ctl_path,
+        Frame::CreateSession {
+            path: session_path.display().to_string(),
+        },
+    )
+    .await;
+    assert_eq!(resp, Frame::Ok);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Kill the server
+    let resp = control_request(&ctl_path, Frame::KillServer).await;
+    assert_eq!(resp, Frame::Ok);
+
+    // Daemon task should exit
+    let result = timeout(Duration::from_secs(3), daemon).await;
+    assert!(result.is_ok(), "daemon should exit after kill-server");
+
+    // Control socket should be gone
+    assert!(!ctl_path.exists(), "control socket should be removed");
+
     let _ = std::fs::remove_file(&session_path);
 }

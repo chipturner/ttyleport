@@ -5,25 +5,42 @@ use tokio_util::codec::{Decoder, Encoder};
 const TYPE_DATA: u8 = 0x01;
 const TYPE_RESIZE: u8 = 0x02;
 const TYPE_EXIT: u8 = 0x03;
+const TYPE_DETACHED: u8 = 0x04;
 const TYPE_CREATE_SESSION: u8 = 0x10;
 const TYPE_LIST_SESSIONS: u8 = 0x11;
 const TYPE_SESSION_INFO: u8 = 0x12;
 const TYPE_OK: u8 = 0x13;
 const TYPE_ERROR: u8 = 0x14;
+const TYPE_KILL_SESSION: u8 = 0x15;
+const TYPE_KILL_SERVER: u8 = 0x16;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
+
+/// Metadata for one session, returned in SessionInfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub path: String,
+    pub pty_path: String,
+    pub shell_pid: u32,
+    pub created_at: u64,
+    pub attached: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Data(Bytes),
     Resize { cols: u16, rows: u16 },
     Exit { code: i32 },
+    /// Sent to a client when another client takes over the session.
+    Detached,
     // Control frames
     CreateSession { path: String },
     ListSessions,
-    SessionInfo { sessions: Vec<String> },
+    SessionInfo { sessions: Vec<SessionEntry> },
     Ok,
     Error { message: String },
+    KillSession { path: String },
+    KillServer,
 }
 
 pub struct FrameCodec;
@@ -71,6 +88,7 @@ impl Decoder for FrameCodec {
                 let code = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Some(Frame::Exit { code }))
             }
+            TYPE_DETACHED => Ok(Some(Frame::Detached)),
             TYPE_CREATE_SESSION => {
                 let path = String::from_utf8(payload.to_vec()).map_err(|e| {
                     io::Error::new(io::ErrorKind::InvalidData, e)
@@ -85,7 +103,22 @@ impl Decoder for FrameCodec {
                 let sessions = if text.is_empty() {
                     Vec::new()
                 } else {
-                    text.lines().map(String::from).collect()
+                    text.lines()
+                        .filter_map(|line| {
+                            let parts: Vec<&str> = line.split('\t').collect();
+                            if parts.len() == 5 {
+                                Some(SessionEntry {
+                                    path: parts[0].to_string(),
+                                    pty_path: parts[1].to_string(),
+                                    shell_pid: parts[2].parse().unwrap_or(0),
+                                    created_at: parts[3].parse().unwrap_or(0),
+                                    attached: parts[4] == "1",
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
                 };
                 Ok(Some(Frame::SessionInfo { sessions }))
             }
@@ -96,6 +129,13 @@ impl Decoder for FrameCodec {
                 })?;
                 Ok(Some(Frame::Error { message }))
             }
+            TYPE_KILL_SESSION => {
+                let path = String::from_utf8(payload.to_vec()).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e)
+                })?;
+                Ok(Some(Frame::KillSession { path }))
+            }
+            TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown frame type: 0x{frame_type:02x}"),
@@ -125,6 +165,10 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u32(4);
                 dst.put_i32(code);
             }
+            Frame::Detached => {
+                dst.put_u8(TYPE_DETACHED);
+                dst.put_u32(0);
+            }
             Frame::CreateSession { path } => {
                 dst.put_u8(TYPE_CREATE_SESSION);
                 dst.put_u32(path.len() as u32);
@@ -135,7 +179,20 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u32(0);
             }
             Frame::SessionInfo { sessions } => {
-                let text = sessions.join("\n");
+                let text: String = sessions
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            e.path,
+                            e.pty_path,
+                            e.shell_pid,
+                            e.created_at,
+                            if e.attached { "1" } else { "0" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 dst.put_u8(TYPE_SESSION_INFO);
                 dst.put_u32(text.len() as u32);
                 dst.extend_from_slice(text.as_bytes());
@@ -148,6 +205,15 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u8(TYPE_ERROR);
                 dst.put_u32(message.len() as u32);
                 dst.extend_from_slice(message.as_bytes());
+            }
+            Frame::KillSession { path } => {
+                dst.put_u8(TYPE_KILL_SESSION);
+                dst.put_u32(path.len() as u32);
+                dst.extend_from_slice(path.as_bytes());
+            }
+            Frame::KillServer => {
+                dst.put_u8(TYPE_KILL_SERVER);
+                dst.put_u32(0);
             }
         }
         Ok(())

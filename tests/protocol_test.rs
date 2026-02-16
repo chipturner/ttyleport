@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
-use ttyleport::protocol::{Frame, FrameCodec};
+use ttyleport::protocol::{Frame, FrameCodec, SessionEntry};
 
 #[test]
 fn encode_data_frame() {
@@ -114,8 +114,33 @@ fn roundtrip_session_info() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
-        sessions: vec!["/tmp/a.sock".to_string(), "/tmp/b.sock".to_string()],
+        sessions: vec![
+            SessionEntry {
+                path: "/tmp/a.sock".to_string(),
+                pty_path: "/dev/pts/3".to_string(),
+                shell_pid: 1234,
+                created_at: 1700000000,
+                attached: true,
+            },
+            SessionEntry {
+                path: "/tmp/b.sock".to_string(),
+                pty_path: "/dev/pts/5".to_string(),
+                shell_pid: 5678,
+                created_at: 1700000100,
+                attached: false,
+            },
+        ],
     };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_session_info_empty() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::SessionInfo { sessions: vec![] };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -140,4 +165,34 @@ fn roundtrip_error() {
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_detached() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::Detached, &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::Detached, decoded);
+}
+
+#[test]
+fn roundtrip_kill_session() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::KillSession {
+        path: "/tmp/test.sock".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_kill_server() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::KillServer, &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::KillServer, decoded);
 }

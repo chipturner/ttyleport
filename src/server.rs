@@ -6,11 +6,44 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio_util::codec::Framed;
 use tracing::{debug, info};
+
+pub struct SessionMetadata {
+    pub pty_path: String,
+    pub shell_pid: u32,
+    pub created_at: u64,
+    pub attached: AtomicBool,
+}
+
+/// Wraps a child process and its process group ID.
+/// On drop, sends SIGHUP to the entire process group.
+struct ManagedChild {
+    child: tokio::process::Child,
+    pgid: nix::unistd::Pid,
+}
+
+impl ManagedChild {
+    fn new(child: tokio::process::Child) -> Self {
+        let pid = child.id().expect("child should have pid") as i32;
+        Self {
+            child,
+            pgid: nix::unistd::Pid::from_raw(pid),
+        }
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        let _ = nix::sys::signal::killpg(self.pgid, nix::sys::signal::Signal::SIGHUP);
+        let _ = self.child.try_wait();
+    }
+}
 
 /// Why the relay loop exited.
 enum RelayExit {
@@ -20,7 +53,10 @@ enum RelayExit {
     ShellExited(i32),
 }
 
-pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
+pub async fn run(
+    socket_path: &Path,
+    metadata_slot: Arc<OnceLock<SessionMetadata>>,
+) -> anyhow::Result<()> {
     // Clean up stale socket file
     if socket_path.exists() {
         std::fs::remove_file(socket_path)?;
@@ -34,6 +70,11 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
     let master: OwnedFd = pty.master;
     let slave: OwnedFd = pty.slave;
 
+    // Get PTY slave name before we drop the slave fd
+    let pty_path = nix::unistd::ttyname(&slave)
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
     // Spawn shell on slave PTY
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let slave_fd = slave.as_raw_fd();
@@ -42,7 +83,7 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
     };
     drop(slave);
 
-    let mut child = unsafe {
+    let mut managed = ManagedChild::new(unsafe {
         Command::new(&shell)
             .pre_exec(move || {
                 nix::unistd::setsid().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -53,7 +94,20 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
             .stdout(Stdio::from_raw_fd(stdout_fd))
             .stderr(Stdio::from_raw_fd(stderr_fd))
             .spawn()?
-    };
+    });
+
+    let shell_pid = managed.child.id().unwrap_or(0);
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let _ = metadata_slot.set(SessionMetadata {
+        pty_path,
+        shell_pid,
+        created_at,
+        attached: AtomicBool::new(false),
+    });
 
     // Set master to non-blocking for AsyncFd
     let raw_master = master.as_raw_fd();
@@ -74,12 +128,16 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
                 info!("client connected");
                 stream
             }
-            status = child.wait() => {
+            status = managed.child.wait() => {
                 let code = status?.code().unwrap_or(1);
                 info!(code, "shell exited while awaiting client");
                 break;
             }
         };
+
+        if let Some(meta) = metadata_slot.get() {
+            meta.attached.store(true, Ordering::Relaxed);
+        }
 
         let mut framed = Framed::new(stream, FrameCodec);
 
@@ -155,7 +213,16 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
                     }
                 }
 
-                status = child.wait() => {
+                result = listener.accept() => {
+                    // New client takeover: detach old client, switch to new
+                    if let Ok((new_stream, _)) = result {
+                        info!("new client connected, detaching old client");
+                        let _ = framed.send(Frame::Detached).await;
+                        framed = Framed::new(new_stream, FrameCodec);
+                    }
+                }
+
+                status = managed.child.wait() => {
                     let code = status?.code().unwrap_or(1);
                     info!(code, "shell exited");
                     let _ = framed.send(Frame::Exit { code }).await;
@@ -166,6 +233,9 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
 
         match exit {
             RelayExit::ClientGone => {
+                if let Some(meta) = metadata_slot.get() {
+                    meta.attached.store(false, Ordering::Relaxed);
+                }
                 info!("client disconnected, waiting for reconnect");
                 continue;
             }

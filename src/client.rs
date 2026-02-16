@@ -14,6 +14,29 @@ use tracing::{debug, info};
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+struct NonBlockGuard {
+    fd: std::os::fd::RawFd,
+    original_flags: nix::fcntl::OFlag,
+}
+
+impl NonBlockGuard {
+    fn set(fd: std::os::fd::RawFd) -> nix::Result<Self> {
+        let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL)?;
+        let original_flags = nix::fcntl::OFlag::from_bits_truncate(flags);
+        nix::fcntl::fcntl(
+            fd,
+            nix::fcntl::FcntlArg::F_SETFL(original_flags | nix::fcntl::OFlag::O_NONBLOCK),
+        )?;
+        Ok(Self { fd, original_flags })
+    }
+}
+
+impl Drop for NonBlockGuard {
+    fn drop(&mut self) {
+        let _ = nix::fcntl::fcntl(self.fd, nix::fcntl::FcntlArg::F_SETFL(self.original_flags));
+    }
+}
+
 struct RawModeGuard {
     fd: BorrowedFd<'static>,
     original: Termios,
@@ -117,6 +140,10 @@ async fn relay(
                         info!(code, "server sent exit");
                         return Ok(Some(code));
                     }
+                    Some(Ok(Frame::Detached)) => {
+                        info!("detached by another client");
+                        return Ok(Some(0));
+                    }
                     Some(Ok(_)) => {} // ignore control/resize frames
                     Some(Err(e)) => {
                         debug!("server connection error: {e}");
@@ -150,13 +177,10 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
     let stdin_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
     let _guard = RawModeGuard::enter(stdin_borrowed)?;
 
-    // Set stdin to non-blocking for AsyncFd
+    // Set stdin to non-blocking for AsyncFd — guard restores on drop.
+    // Declared BEFORE async_stdin so it drops AFTER AsyncFd (reverse drop order).
     let raw_fd = stdin_fd.as_raw_fd();
-    let flags = nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFL)?;
-    let mut oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
-    oflags |= nix::fcntl::OFlag::O_NONBLOCK;
-    nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
-
+    let _nb_guard = NonBlockGuard::set(raw_fd)?;
     let async_stdin = AsyncFd::new(io::stdin())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
