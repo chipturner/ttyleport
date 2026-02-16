@@ -5,6 +5,10 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "ttyleport", about = "Teleport a TTY over a socket")]
 struct Cli {
+    /// Path to the daemon control socket (overrides default)
+    #[arg(long, global = true)]
+    ctl_socket: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -37,24 +41,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let ctl_path = cli
+        .ctl_socket
+        .unwrap_or_else(ttyleport::daemon::control_socket_path);
     match cli.command {
-        Command::Serve { socket, foreground } => serve(socket, foreground).await,
+        Command::Serve { socket, foreground } => serve(socket, foreground, ctl_path).await,
         Command::Connect { socket } => {
             let code = ttyleport::client::run(&socket).await?;
             std::process::exit(code);
         }
-        Command::List => list().await,
+        Command::List => list(ctl_path).await,
     }
 }
 
-async fn serve(session_socket: PathBuf, foreground: bool) -> anyhow::Result<()> {
+async fn serve(session_socket: PathBuf, foreground: bool, ctl_path: PathBuf) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use ttyleport::daemon;
     use ttyleport::protocol::{Frame, FrameCodec};
-
-    let ctl_path = daemon::control_socket_path();
 
     if foreground {
         // Run daemon in foreground — create the session, then run daemon loop
@@ -89,7 +93,7 @@ async fn serve(session_socket: PathBuf, foreground: bool) -> anyhow::Result<()> 
             }
         });
 
-        daemon::run(&ctl_path).await
+        ttyleport::daemon::run(&ctl_path).await
     } else {
         // Check if daemon is already running
         let daemon_running = UnixStream::connect(&ctl_path).await.is_ok();
@@ -104,7 +108,7 @@ async fn serve(session_socket: PathBuf, foreground: bool) -> anyhow::Result<()> 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 rt.block_on(async {
-                    if let Err(e) = daemon::run(&ctl).await {
+                    if let Err(e) = ttyleport::daemon::run(&ctl).await {
                         eprintln!("daemon error: {e}");
                     }
                 });
@@ -143,14 +147,11 @@ async fn serve(session_socket: PathBuf, foreground: bool) -> anyhow::Result<()> 
     }
 }
 
-async fn list() -> anyhow::Result<()> {
+async fn list(ctl_path: PathBuf) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use ttyleport::daemon;
     use ttyleport::protocol::{Frame, FrameCodec};
-
-    let ctl_path = daemon::control_socket_path();
     let stream = UnixStream::connect(&ctl_path)
         .await
         .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {ctl_path:?})"))?;
