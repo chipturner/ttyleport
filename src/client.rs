@@ -5,11 +5,14 @@ use nix::sys::termios::{self, SetArg, Termios};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::codec::Framed;
 use tracing::{debug, info};
+
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RawModeGuard {
     fd: BorrowedFd<'static>,
@@ -54,6 +57,21 @@ async fn connect(socket_path: &Path) -> io::Result<Framed<UnixStream, FrameCodec
     Ok(Framed::new(stream, FrameCodec))
 }
 
+/// Send a frame with a timeout. Returns false if the send failed or timed out.
+async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -> bool {
+    match tokio::time::timeout(SEND_TIMEOUT, framed.send(frame)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            debug!("send error: {e}");
+            false
+        }
+        Err(_) => {
+            debug!("send timed out");
+            false
+        }
+    }
+}
+
 /// Relay between stdin/stdout and the framed socket.
 /// Returns `Some(code)` on clean shell exit, `None` on server disconnect.
 async fn relay(
@@ -64,7 +82,9 @@ async fn relay(
 ) -> anyhow::Result<Option<i32>> {
     // Send initial window size
     let (cols, rows) = get_terminal_size();
-    framed.send(Frame::Resize { cols, rows }).await?;
+    if !timed_send(framed, Frame::Resize { cols, rows }).await {
+        return Ok(None);
+    }
 
     loop {
         tokio::select! {
@@ -77,7 +97,9 @@ async fn relay(
                     }
                     Ok(Ok(n)) => {
                         debug!(len = n, "stdin → socket");
-                        framed.send(Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await?;
+                        if !timed_send(framed, Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await {
+                            return Ok(None);
+                        }
                     }
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_would_block) => continue,
@@ -110,7 +132,9 @@ async fn relay(
             _ = sigwinch.recv() => {
                 let (cols, rows) = get_terminal_size();
                 debug!(cols, rows, "SIGWINCH → resize");
-                framed.send(Frame::Resize { cols, rows }).await?;
+                if !timed_send(framed, Frame::Resize { cols, rows }).await {
+                    return Ok(None);
+                }
             }
         }
     }
@@ -142,7 +166,21 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
             Some(code) => return Ok(code),
             None => {
                 info!("reconnecting...");
-                framed = connect(socket_path).await?;
+                // In raw mode, Ctrl-C arrives as byte 0x03 on stdin.
+                // Select on both so the user can kill the client during reconnect.
+                framed = loop {
+                    tokio::select! {
+                        result = connect(socket_path) => break result?,
+                        ready = async_stdin.readable() => {
+                            let mut guard = ready?;
+                            if let Ok(Ok(n)) = guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
+                                if buf[..n].contains(&0x03) {
+                                    return Ok(130);
+                                }
+                            }
+                        }
+                    }
+                };
             }
         }
     }
