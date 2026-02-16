@@ -96,7 +96,7 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
                         exit_code = code;
                         break;
                     }
-                    Some(Ok(Frame::Resize { .. })) => {}
+                    Some(Ok(_)) => {} // ignore control/resize frames
                     Some(Err(e)) => return Err(e.into()),
                     None => break,
                 }

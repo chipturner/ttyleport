@@ -87,3 +87,57 @@ fn decode_invalid_type_returns_error() {
     let mut buf = BytesMut::from(&[0xFF, 0x00, 0x00, 0x00, 0x00][..]);
     assert!(codec.decode(&mut buf).is_err());
 }
+
+#[test]
+fn roundtrip_create_session() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::CreateSession {
+        path: "/tmp/test.sock".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_list_sessions() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::ListSessions, &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::ListSessions, decoded);
+}
+
+#[test]
+fn roundtrip_session_info() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::SessionInfo {
+        sessions: vec!["/tmp/a.sock".to_string(), "/tmp/b.sock".to_string()],
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_ok() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::Ok, &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::Ok, decoded);
+}
+
+#[test]
+fn roundtrip_error() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Error {
+        message: "something failed".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}

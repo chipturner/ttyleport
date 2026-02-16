@@ -119,6 +119,8 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<()> {
                         Some(Ok(Frame::Exit { .. })) | None => {
                             break RelayExit::ClientGone;
                         }
+                        // Control frames ignored on session sockets
+                        Some(Ok(_)) => {}
                         Some(Err(e)) => return Err(e.into()),
                     }
                 }

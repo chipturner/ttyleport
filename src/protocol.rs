@@ -5,6 +5,11 @@ use tokio_util::codec::{Decoder, Encoder};
 const TYPE_DATA: u8 = 0x01;
 const TYPE_RESIZE: u8 = 0x02;
 const TYPE_EXIT: u8 = 0x03;
+const TYPE_CREATE_SESSION: u8 = 0x10;
+const TYPE_LIST_SESSIONS: u8 = 0x11;
+const TYPE_SESSION_INFO: u8 = 0x12;
+const TYPE_OK: u8 = 0x13;
+const TYPE_ERROR: u8 = 0x14;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
 
@@ -13,6 +18,12 @@ pub enum Frame {
     Data(Bytes),
     Resize { cols: u16, rows: u16 },
     Exit { code: i32 },
+    // Control frames
+    CreateSession { path: String },
+    ListSessions,
+    SessionInfo { sessions: Vec<String> },
+    Ok,
+    Error { message: String },
 }
 
 pub struct FrameCodec;
@@ -60,6 +71,31 @@ impl Decoder for FrameCodec {
                 let code = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Some(Frame::Exit { code }))
             }
+            TYPE_CREATE_SESSION => {
+                let path = String::from_utf8(payload.to_vec()).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e)
+                })?;
+                Ok(Some(Frame::CreateSession { path }))
+            }
+            TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
+            TYPE_SESSION_INFO => {
+                let text = String::from_utf8(payload.to_vec()).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e)
+                })?;
+                let sessions = if text.is_empty() {
+                    Vec::new()
+                } else {
+                    text.lines().map(String::from).collect()
+                };
+                Ok(Some(Frame::SessionInfo { sessions }))
+            }
+            TYPE_OK => Ok(Some(Frame::Ok)),
+            TYPE_ERROR => {
+                let message = String::from_utf8(payload.to_vec()).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e)
+                })?;
+                Ok(Some(Frame::Error { message }))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown frame type: 0x{frame_type:02x}"),
@@ -88,6 +124,30 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u8(TYPE_EXIT);
                 dst.put_u32(4);
                 dst.put_i32(code);
+            }
+            Frame::CreateSession { path } => {
+                dst.put_u8(TYPE_CREATE_SESSION);
+                dst.put_u32(path.len() as u32);
+                dst.extend_from_slice(path.as_bytes());
+            }
+            Frame::ListSessions => {
+                dst.put_u8(TYPE_LIST_SESSIONS);
+                dst.put_u32(0);
+            }
+            Frame::SessionInfo { sessions } => {
+                let text = sessions.join("\n");
+                dst.put_u8(TYPE_SESSION_INFO);
+                dst.put_u32(text.len() as u32);
+                dst.extend_from_slice(text.as_bytes());
+            }
+            Frame::Ok => {
+                dst.put_u8(TYPE_OK);
+                dst.put_u32(0);
+            }
+            Frame::Error { message } => {
+                dst.put_u8(TYPE_ERROR);
+                dst.put_u32(message.len() as u32);
+                dst.extend_from_slice(message.as_bytes());
             }
         }
         Ok(())
