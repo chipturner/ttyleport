@@ -117,6 +117,9 @@ async fn relay(
 }
 
 pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
+    // First connection before raw mode so Ctrl-C works while waiting
+    let mut framed = connect(socket_path).await?;
+
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     // Safety: stdin lives for the duration of the program
@@ -135,12 +138,11 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
     let mut buf = vec![0u8; 4096];
 
     loop {
-        let mut framed = connect(socket_path).await?;
-
         match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf).await? {
             Some(code) => return Ok(code),
             None => {
                 info!("reconnecting...");
+                framed = connect(socket_path).await?;
             }
         }
     }

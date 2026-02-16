@@ -10,6 +10,8 @@ ttyleport teleports a TTY over a Unix domain socket. Single binary, three subcom
 - `ttyleport connect <socket-path>` — connects to a session socket, enters raw mode, relays stdin/stdout
 - `ttyleport list` — lists active sessions managed by the daemon
 
+Global option: `--ctl-socket <path>` overrides the default control socket path.
+
 Similar to Eternal Terminal but socket-based. Sessions are persistent (shell survives client disconnect). A background daemon manages multiple sessions.
 
 ## Build & Test
@@ -35,7 +37,7 @@ Four modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 
 - **`server`** — Binds UDS, accepts one client, allocates PTY via `nix::pty::openpty`, spawns `$SHELL` with `setsid`+`TIOCSCTTY` in `pre_exec`. Wraps PTY master fd in `tokio::io::unix::AsyncFd` (set non-blocking via fcntl). Two nested loops: outer accepts clients (PTY persists), inner is `tokio::select!` over socket frames and PTY reads. `RelayExit` enum distinguishes client disconnect (re-accept) from shell exit (done). Outer loop also selects on `child.wait()` so shell exit during disconnect is detected. Resize frames apply via `ioctl(TIOCSWINSZ)`. PTY EOF produces `EIO` which is treated as clean shutdown.
 
-- **`client`** — Connects to UDS, saves/restores terminal via `RawModeGuard` drop guard (`cfmakeraw`/`tcsetattr`), relays stdin to socket, handles `SIGWINCH` as Resize frames via `tokio::signal::unix`.
+- **`client`** — Three-function structure: `connect()` retries on ConnectionRefused/NotFound, `relay()` handles stdin/socket I/O returning `Some(code)` on clean exit or `None` on disconnect, `run()` is the outer reconnect loop. Saves/restores terminal via `RawModeGuard` drop guard (`cfmakeraw`/`tcsetattr`), handles `SIGWINCH` as Resize frames via `tokio::signal::unix`. Auto-reconnects on server disconnect.
 
 ## Patterns
 
