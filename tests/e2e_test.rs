@@ -124,3 +124,87 @@ async fn server_sends_exit_frame_on_shell_exit() {
     assert!(got_exit, "expected Exit frame from server");
     let _ = std::fs::remove_file(&socket_path);
 }
+
+#[tokio::test]
+async fn reconnect_preserves_shell_session() {
+    let socket_path = std::env::temp_dir().join("ttyleport-test-reconnect.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let path = socket_path.clone();
+    let server = tokio::spawn(async move { ttyleport::server::run(&path).await });
+
+    // First connection: set a variable in the shell
+    let mut framed = connect_to_server(&socket_path).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    framed
+        .send(Frame::Data(Bytes::from("export TTYLEPORT_MARKER=alive\n")))
+        .await
+        .unwrap();
+    read_available_data(&mut framed, Duration::from_millis(500)).await;
+
+    // Disconnect by dropping the framed stream
+    drop(framed);
+
+    // Give server time to notice disconnect and re-accept
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Second connection: verify the variable is still set
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed
+        .send(Frame::Resize { cols: 80, rows: 24 })
+        .await
+        .unwrap();
+
+    // Drain any buffered output
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    framed
+        .send(Frame::Data(Bytes::from("echo $TTYLEPORT_MARKER\n")))
+        .await
+        .unwrap();
+
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("alive"),
+        "shell session should persist across reconnect, got: {output_str}"
+    );
+
+    // Clean up
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[tokio::test]
+async fn server_exits_when_shell_dies_while_disconnected() {
+    let socket_path = std::env::temp_dir().join("ttyleport-test-shell-dies.sock");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let path = socket_path.clone();
+    let server = tokio::spawn(async move { ttyleport::server::run(&path).await });
+
+    // Connect and tell shell to exit after a delay, then disconnect
+    let mut framed = connect_to_server(&socket_path).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Schedule shell to exit after we disconnect
+    framed
+        .send(Frame::Data(Bytes::from("sleep 0.5 && exit 0\n")))
+        .await
+        .unwrap();
+    read_available_data(&mut framed, Duration::from_millis(200)).await;
+
+    // Disconnect
+    drop(framed);
+
+    // Server should exit once the shell dies (within a few seconds)
+    let result = timeout(Duration::from_secs(5), server).await;
+    assert!(
+        result.is_ok(),
+        "server should exit after shell dies while disconnected"
+    );
+    let _ = std::fs::remove_file(&socket_path);
+}
