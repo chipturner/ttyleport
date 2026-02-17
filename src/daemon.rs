@@ -106,9 +106,7 @@ pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
                 let sp = session_path.clone();
                 let metadata = Arc::new(OnceLock::new());
                 let meta_clone = Arc::clone(&metadata);
-                let handle = tokio::spawn(async move {
-                    server::run(&sp, meta_clone).await
-                });
+                let handle = tokio::spawn(async move { server::run(&sp, meta_clone).await });
                 sessions.insert(session_path, SessionState { handle, metadata });
 
                 info!(path = %path, "session created");

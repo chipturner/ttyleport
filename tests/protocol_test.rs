@@ -50,7 +50,10 @@ fn roundtrip_data() {
 fn roundtrip_resize() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Resize { cols: 120, rows: 40 };
+    let original = Frame::Resize {
+        cols: 120,
+        rows: 40,
+    };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);

@@ -92,9 +92,7 @@ async fn server_spawns_shell_and_relays_output() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
     // connect_to_server already verified shell output arrived
@@ -114,9 +112,7 @@ async fn server_relays_command_output() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
 
@@ -150,9 +146,7 @@ async fn server_sends_exit_frame_on_shell_exit() {
 
     let path = socket_path.clone();
     let _server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
 
@@ -178,9 +172,7 @@ async fn reconnect_preserves_shell_session() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     // First connection: set a variable in the shell
     let mut framed = connect_to_server(&socket_path).await;
@@ -235,9 +227,7 @@ async fn server_exits_when_shell_dies_while_disconnected() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     // Connect and tell shell to exit after a delay, then disconnect
     let mut framed = connect_to_server(&socket_path).await;
@@ -269,9 +259,8 @@ async fn second_client_detaches_first() {
     let _ = std::fs::remove_file(&socket_path);
 
     let path = socket_path.clone();
-    let server = tokio::spawn(async move {
-        ttyleport::server::run(&path, Arc::new(OnceLock::new())).await
-    });
+    let server =
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     // First client connects
     let mut client1 = connect_to_server(&socket_path).await;
@@ -332,9 +321,7 @@ async fn exit_code_zero_sends_exit_frame() {
 
     let path = socket_path.clone();
     let _server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -389,9 +376,7 @@ async fn rapid_reconnect_cycles() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     // First connection: set a marker
     let mut framed = connect_to_server(&socket_path).await;
@@ -447,9 +432,7 @@ async fn control_frame_on_session_socket_is_ignored() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -495,9 +478,7 @@ async fn pty_buffer_saturation_and_resume() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -550,16 +531,17 @@ async fn resize_propagates_to_pty() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
     // Set a specific window size
     framed
-        .send(Frame::Resize { cols: 132, rows: 43 })
+        .send(Frame::Resize {
+            cols: 132,
+            rows: 43,
+        })
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -595,7 +577,9 @@ async fn metadata_reflects_attached_state() {
 
     // Before connect: not attached
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let m = meta.get().expect("metadata should be set after server starts");
+    let m = meta
+        .get()
+        .expect("metadata should be set after server starts");
     assert!(
         !m.attached.load(std::sync::atomic::Ordering::Relaxed),
         "should not be attached before client connects"
@@ -638,9 +622,7 @@ async fn client_explicit_exit_frame() {
 
     let path = socket_path.clone();
     let server =
-        tokio::spawn(
-            async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await },
-        );
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
 
     let mut framed = connect_to_server(&socket_path).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;

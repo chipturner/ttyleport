@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::codec::Framed;
 use tracing::{debug, info};
 
@@ -44,17 +44,17 @@ struct RawModeGuard {
 
 impl RawModeGuard {
     fn enter(fd: BorrowedFd<'static>) -> nix::Result<Self> {
-        let original = termios::tcgetattr(&fd)?;
+        let original = termios::tcgetattr(fd)?;
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(&fd, SetArg::TCSAFLUSH, &raw)?;
+        termios::tcsetattr(fd, SetArg::TCSAFLUSH, &raw)?;
         Ok(Self { fd, original })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = termios::tcsetattr(&self.fd, SetArg::TCSAFLUSH, &self.original);
+        let _ = termios::tcsetattr(self.fd, SetArg::TCSAFLUSH, &self.original);
     }
 }
 
@@ -68,8 +68,10 @@ async fn connect(socket_path: &Path) -> io::Result<Framed<UnixStream, FrameCodec
     let stream = loop {
         match UnixStream::connect(socket_path).await {
             Ok(s) => break s,
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused
-                   || e.kind() == io::ErrorKind::NotFound => {
+            Err(e)
+                if e.kind() == io::ErrorKind::ConnectionRefused
+                    || e.kind() == io::ErrorKind::NotFound =>
+            {
                 debug!(path = %socket_path.display(), "waiting for session...");
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
@@ -174,7 +176,8 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     // Safety: stdin lives for the duration of the program
-    let stdin_borrowed: BorrowedFd<'static> = unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
+    let stdin_borrowed: BorrowedFd<'static> =
+        unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
     let _guard = RawModeGuard::enter(stdin_borrowed)?;
 
     // Set stdin to non-blocking for AsyncFd — guard restores on drop.
@@ -197,10 +200,10 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
                         result = connect(socket_path) => break result?,
                         ready = async_stdin.readable() => {
                             let mut guard = ready?;
-                            if let Ok(Ok(n)) = guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
-                                if buf[..n].contains(&0x03) {
-                                    return Ok(130);
-                                }
+                            if let Ok(Ok(n)) = guard.try_io(|inner| inner.get_ref().read(&mut buf))
+                                && buf[..n].contains(&0x03)
+                            {
+                                return Ok(130);
                             }
                         }
                     }

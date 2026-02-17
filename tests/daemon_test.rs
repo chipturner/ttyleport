@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::Semaphore;
@@ -79,7 +79,10 @@ async fn connect_session(session_path: &std::path::Path) -> Framed<UnixStream, F
         match timeout(Duration::from_secs(1), framed.next()).await {
             Ok(Some(Ok(Frame::Data(_)))) => break,
             _ if tokio::time::Instant::now() >= deadline => {
-                panic!("shell did not produce output within 15s on {}", session_path.display())
+                panic!(
+                    "shell did not produce output within 15s on {}",
+                    session_path.display()
+                )
             }
             _ => continue,
         }
@@ -280,7 +283,11 @@ async fn create_after_kill_same_path() {
         },
     )
     .await;
-    assert_eq!(resp, Frame::Ok, "should be able to create session at same path after kill");
+    assert_eq!(
+        resp,
+        Frame::Ok,
+        "should be able to create session at same path after kill"
+    );
 
     // Verify recreated session appears in list with valid metadata
     // Poll until metadata is populated (shell_pid > 0)
@@ -416,7 +423,10 @@ async fn kill_server_no_sessions() {
     assert_eq!(resp, Frame::Ok);
 
     let result = timeout(Duration::from_secs(3), daemon).await;
-    assert!(result.is_ok(), "daemon should exit after kill-server with no sessions");
+    assert!(
+        result.is_ok(),
+        "daemon should exit after kill-server with no sessions"
+    );
 
     assert!(!ctl_path.exists(), "control socket should be removed");
 }
@@ -471,9 +481,7 @@ async fn session_natural_exit_reaps_from_list() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions }
-                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
-            {
+            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
                 shell_pid = sessions[0].shell_pid;
                 break;
             }
@@ -535,7 +543,11 @@ async fn list_before_session_ready() {
     let resp = control_request(&ctl_path, Frame::ListSessions).await;
     match &resp {
         Frame::SessionInfo { sessions } => {
-            assert_eq!(sessions.len(), 1, "session should appear in list immediately");
+            assert_eq!(
+                sessions.len(),
+                1,
+                "session should appear in list immediately"
+            );
             assert_eq!(sessions[0].path, session_path.display().to_string());
             // shell_pid might be 0 if metadata isn't ready yet — that's fine
         }

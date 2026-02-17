@@ -29,17 +29,30 @@ pub struct SessionEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Data(Bytes),
-    Resize { cols: u16, rows: u16 },
-    Exit { code: i32 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Exit {
+        code: i32,
+    },
     /// Sent to a client when another client takes over the session.
     Detached,
     // Control frames
-    CreateSession { path: String },
+    CreateSession {
+        path: String,
+    },
     ListSessions,
-    SessionInfo { sessions: Vec<SessionEntry> },
+    SessionInfo {
+        sessions: Vec<SessionEntry>,
+    },
     Ok,
-    Error { message: String },
-    KillSession { path: String },
+    Error {
+        message: String,
+    },
+    KillSession {
+        path: String,
+    },
     KillServer,
 }
 
@@ -90,16 +103,14 @@ impl Decoder for FrameCodec {
             }
             TYPE_DETACHED => Ok(Some(Frame::Detached)),
             TYPE_CREATE_SESSION => {
-                let path = String::from_utf8(payload.to_vec()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e)
-                })?;
+                let path = String::from_utf8(payload.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(Some(Frame::CreateSession { path }))
             }
             TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
             TYPE_SESSION_INFO => {
-                let text = String::from_utf8(payload.to_vec()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e)
-                })?;
+                let text = String::from_utf8(payload.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let sessions = if text.is_empty() {
                     Vec::new()
                 } else {
@@ -124,15 +135,13 @@ impl Decoder for FrameCodec {
             }
             TYPE_OK => Ok(Some(Frame::Ok)),
             TYPE_ERROR => {
-                let message = String::from_utf8(payload.to_vec()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e)
-                })?;
+                let message = String::from_utf8(payload.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(Some(Frame::Error { message }))
             }
             TYPE_KILL_SESSION => {
-                let path = String::from_utf8(payload.to_vec()).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e)
-                })?;
+                let path = String::from_utf8(payload.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(Some(Frame::KillSession { path }))
             }
             TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),

@@ -79,14 +79,18 @@ pub async fn run(
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let slave_fd = slave.as_raw_fd();
     let (stdin_fd, stdout_fd, stderr_fd) = unsafe {
-        (libc::dup(slave_fd), libc::dup(slave_fd), libc::dup(slave_fd))
+        (
+            libc::dup(slave_fd),
+            libc::dup(slave_fd),
+            libc::dup(slave_fd),
+        )
     };
     drop(slave);
 
     let mut managed = ManagedChild::new(unsafe {
         Command::new(&shell)
             .pre_exec(move || {
-                nix::unistd::setsid().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                nix::unistd::setsid().map_err(io::Error::other)?;
                 libc::ioctl(stdin_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
                 Ok(())
             })
