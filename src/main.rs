@@ -106,7 +106,7 @@ async fn new_session(
 
     // Ensure the sessions directory exists
     if let Some(parent) = session_socket.parent() {
-        std::fs::create_dir_all(parent)?;
+        ttyleport::security::secure_create_dir_all(parent)?;
     }
 
     if foreground {
@@ -145,7 +145,7 @@ async fn new_session(
 
         if !daemon_running {
             if let Some(parent) = ctl_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                ttyleport::security::secure_create_dir_all(parent)?;
             }
 
             let ctl = ctl_path.clone();

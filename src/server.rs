@@ -3,16 +3,15 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nix::pty::openpty;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::unix::AsyncFd;
-use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio_util::codec::Framed;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct SessionMetadata {
     pub pty_path: String,
@@ -57,12 +56,7 @@ pub async fn run(
     socket_path: &Path,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
 ) -> anyhow::Result<()> {
-    // Clean up stale socket file
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = crate::security::bind_unix_listener(socket_path)?;
     info!(path = %socket_path.display(), "listening");
 
     // Allocate PTY (once, before accept loop)
@@ -78,25 +72,22 @@ pub async fn run(
     // Spawn shell on slave PTY
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let slave_fd = slave.as_raw_fd();
-    let (stdin_fd, stdout_fd, stderr_fd) = unsafe {
-        (
-            libc::dup(slave_fd),
-            libc::dup(slave_fd),
-            libc::dup(slave_fd),
-        )
-    };
+    let stdin_fd = crate::security::checked_dup(slave_fd)?;
+    let stdout_fd = crate::security::checked_dup(slave_fd)?;
+    let stderr_fd = crate::security::checked_dup(slave_fd)?;
+    let raw_stdin = stdin_fd.as_raw_fd();
     drop(slave);
 
     let mut managed = ManagedChild::new(unsafe {
         Command::new(&shell)
             .pre_exec(move || {
                 nix::unistd::setsid().map_err(io::Error::other)?;
-                libc::ioctl(stdin_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
+                libc::ioctl(raw_stdin, libc::TIOCSCTTY as libc::c_ulong, 0);
                 Ok(())
             })
-            .stdin(Stdio::from_raw_fd(stdin_fd))
-            .stdout(Stdio::from_raw_fd(stdout_fd))
-            .stderr(Stdio::from_raw_fd(stderr_fd))
+            .stdin(Stdio::from(stdin_fd))
+            .stdout(Stdio::from(stdout_fd))
+            .stderr(Stdio::from(stderr_fd))
             .spawn()?
     });
 
@@ -129,6 +120,10 @@ pub async fn run(
         let stream = tokio::select! {
             result = listener.accept() => {
                 let (stream, _addr) = result?;
+                if let Err(e) = crate::security::verify_peer_uid(&stream) {
+                    warn!("{e}");
+                    continue;
+                }
                 info!("client connected");
                 stream
             }
@@ -162,6 +157,7 @@ pub async fn run(
                             }
                         }
                         Some(Ok(Frame::Resize { cols, rows })) => {
+                            let (cols, rows) = crate::security::clamp_winsize(cols, rows);
                             debug!(cols, rows, "resize pty");
                             let ws = libc::winsize {
                                 ws_row: rows,
@@ -214,6 +210,10 @@ pub async fn run(
                 result = listener.accept() => {
                     // New client takeover: detach old client, switch to new
                     if let Ok((new_stream, _)) = result {
+                        if let Err(e) = crate::security::verify_peer_uid(&new_stream) {
+                            warn!("{e}");
+                            continue;
+                        }
                         info!("new client connected, detaching old client");
                         let _ = framed.send(Frame::Detached).await;
                         framed = Framed::new(new_stream, FrameCodec);

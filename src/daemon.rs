@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 struct SessionState {
     handle: JoinHandle<anyhow::Result<()>>,
@@ -64,17 +63,17 @@ fn build_session_entries(sessions: &HashMap<PathBuf, SessionState>) -> Vec<Sessi
 
 /// Run the daemon, listening on the control socket.
 pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
-    // Ensure parent directory exists
+    // Restrictive umask for all files/sockets created by the daemon
+    unsafe {
+        libc::umask(0o077);
+    }
+
+    // Ensure parent directory exists with secure permissions
     if let Some(parent) = ctl_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::security::secure_create_dir_all(parent)?;
     }
 
-    // Clean up stale socket
-    if ctl_path.exists() {
-        std::fs::remove_file(ctl_path)?;
-    }
-
-    let listener = UnixListener::bind(ctl_path)?;
+    let listener = crate::security::bind_unix_listener(ctl_path)?;
     info!(path = %ctl_path.display(), "daemon listening");
 
     let mut sessions: HashMap<PathBuf, SessionState> = HashMap::new();
@@ -83,6 +82,10 @@ pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
         reap_sessions(&mut sessions);
 
         let (stream, _addr) = listener.accept().await?;
+        if let Err(e) = crate::security::verify_peer_uid(&stream) {
+            warn!("{e}");
+            continue;
+        }
         let mut framed = Framed::new(stream, FrameCodec);
 
         // Handle one control request per connection

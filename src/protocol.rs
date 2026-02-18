@@ -15,6 +15,7 @@ const TYPE_KILL_SESSION: u8 = 0x15;
 const TYPE_KILL_SERVER: u8 = 0x16;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
+const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Metadata for one session, returned in SessionInfo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +70,13 @@ impl Decoder for FrameCodec {
 
         let frame_type = src[0];
         let payload_len = u32::from_be_bytes([src[1], src[2], src[3], src[4]]) as usize;
+
+        if payload_len > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame payload too large: {payload_len} bytes (max {MAX_FRAME_SIZE})"),
+            ));
+        }
 
         if src.len() < HEADER_LEN + payload_len {
             src.reserve(HEADER_LEN + payload_len - src.len());
