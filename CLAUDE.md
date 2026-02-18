@@ -22,10 +22,10 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ```bash
 cargo build
-cargo test                           # all tests (27 total)
-cargo test --test protocol_test      # codec unit tests only (18)
-cargo test --test daemon_test        # daemon integration tests (4)
-cargo test --test e2e_test           # e2e session tests (5)
+cargo test                           # all tests (58 total)
+cargo test --test protocol_test      # codec unit tests only (31)
+cargo test --test daemon_test        # daemon integration tests (13)
+cargo test --test e2e_test           # e2e session tests (14)
 cargo run -- new -t myproject        # create session (auto-starts daemon)
 cargo run -- attach -t myproject     # attach to session
 cargo run -- ls                      # list active sessions
@@ -37,7 +37,9 @@ tmux start-server\; source-file quicktest.tmux  # manual 3-pane test (server + s
 
 ## Architecture
 
-Four modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`src/main.rs`):
+Five modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`src/main.rs`):
+
+- **`security`** — Shared security utilities. `secure_create_dir_all` (0700 dirs, ownership validation, symlink rejection). `bind_unix_listener` (TOCTOU-safe stale socket handling, 0600 permissions). `verify_peer_uid` (SO_PEERCRED check). `checked_dup` (returns `OwnedFd`). `clamp_winsize`. All socket/directory creation MUST go through this module.
 
 - **`protocol`** — `Frame` enum with session types (Data/Resize/Exit/Detached) and control types (CreateSession/ListSessions/SessionInfo/Ok/Error/KillSession/KillServer). `SessionEntry` struct carries per-session metadata (path, pty_path, shell_pid, created_at, attached). Custom tokio-util `Encoder`/`Decoder`. Wire format: `[type: u8][length: u32 BE][payload]`. Session frame types: `0x01` Data, `0x02` Resize, `0x03` Exit, `0x04` Detached. Control frame types: `0x10` CreateSession, `0x11` ListSessions, `0x12` SessionInfo, `0x13` Ok, `0x14` Error, `0x15` KillSession, `0x16` KillServer.
 
@@ -58,10 +60,11 @@ Four modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 - **Terminal state guards**: `RawModeGuard` restores terminal attrs, `NonBlockGuard` restores stdin flags. Drop order ensures `NonBlockGuard` outlives `AsyncFd`.
 - **Daemon auto-start**: `new-session` without `--foreground` checks for running daemon, spawns one in a background thread with a separate tokio runtime if needed, then sends `CreateSession` via the control socket.
 - **Session name resolution**: Bare names resolve to `$XDG_RUNTIME_DIR/ttyleport/sessions/<name>.sock`.
+- **Security invariants**: Daemon sets `umask(0o077)` at startup. Sockets are 0600, directories 0700. All `accept()` sites verify `SO_PEERCRED` UID. Frame decoder rejects payloads > 1 MB. Resize values clamped to 1..=10000. `/tmp` fallback directories validated for ownership (not symlinks, owned by current uid).
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. All modules implemented and tested (28 tests: 18 protocol codec + 6 e2e session + 4 daemon integration).
+Full CLI with tmux-like ergonomics. All modules implemented and tested (58 tests: 31 protocol codec + 14 e2e session + 13 daemon integration).
 
 ## Development Notes
 
@@ -70,3 +73,5 @@ Full CLI with tmux-like ergonomics. All modules implemented and tested (28 tests
 - **`SessionInfo` wire format** — tab-separated fields per line. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
 - **Test socket cleanup** — each test uses unique temp socket paths. Tests clean up sockets manually; leaked sockets cause subsequent test failures.
 - **Daemon tests are timing-sensitive** — use `tokio::time::sleep` to wait for daemon/session binding. If tests flake, increase sleep durations.
+- **`security` module is load-bearing** — all socket binding and directory creation goes through it. Never use `UnixListener::bind` or `create_dir_all` directly.
+- **`Stdio::from(OwnedFd)`** — server uses safe `Stdio::from()` instead of `Stdio::from_raw_fd()`. Don't reintroduce `FromRawFd` in server.rs.
