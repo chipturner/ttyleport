@@ -168,8 +168,17 @@ pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
                 reap_sessions(&mut sessions);
                 if let Some(id) = resolve_session(&sessions, &session) {
                     let state = &sessions[&id];
-                    let _ = framed.send(Frame::Ok).await;
-                    let _ = state.client_tx.send(framed);
+                    if state.client_tx.is_closed() {
+                        sessions.remove(&id);
+                        let _ = framed
+                            .send(Frame::Error {
+                                message: format!("no such session: {session}"),
+                            })
+                            .await;
+                    } else {
+                        let _ = framed.send(Frame::Ok).await;
+                        let _ = state.client_tx.send(framed);
+                    }
                 } else {
                     let _ = framed
                         .send(Frame::Error {
@@ -184,6 +193,7 @@ pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
                 let _ = framed.send(Frame::SessionInfo { sessions: entries }).await;
             }
             Frame::KillSession { session } => {
+                reap_sessions(&mut sessions);
                 if let Some(id) = resolve_session(&sessions, &session) {
                     let state = sessions.remove(&id).unwrap();
                     state.handle.abort();

@@ -107,12 +107,10 @@ async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<
             let code = ttyleport::client::run(&id, framed, false).await?;
             std::process::exit(code);
         }
-        Some(Ok(Frame::Error { message })) => {
-            anyhow::bail!("{message}");
-        }
-        other => {
-            anyhow::bail!("unexpected response from daemon: {other:?}");
-        }
+        Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
+        Some(Err(e)) => anyhow::bail!("daemon protocol error: {e}"),
+        None => anyhow::bail!("daemon closed connection (is it still running?)"),
+        Some(Ok(other)) => anyhow::bail!("unexpected response from daemon: {other:?}"),
     }
 }
 
@@ -144,12 +142,10 @@ async fn attach(target: String, redraw: bool, ctl_path: PathBuf) -> anyhow::Resu
             let code = ttyleport::client::run(&target, framed, redraw).await?;
             Ok(code)
         }
-        Some(Ok(Frame::Error { message })) => {
-            anyhow::bail!("{message}");
-        }
-        other => {
-            anyhow::bail!("unexpected response from daemon: {other:?}");
-        }
+        Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
+        Some(Err(e)) => anyhow::bail!("daemon protocol error: {e}"),
+        None => anyhow::bail!("daemon closed connection (is it still running?)"),
+        Some(Ok(other)) => anyhow::bail!("unexpected response from daemon: {other:?}"),
     }
 }
 

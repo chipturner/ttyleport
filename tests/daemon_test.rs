@@ -729,3 +729,115 @@ async fn attach_nonexistent_returns_error() {
 
     let _ = std::fs::remove_file(&ctl_path);
 }
+
+/// Regression: attaching to a session whose shell has exited should return Error,
+/// not Ok followed by a silent disconnect.
+#[tokio::test]
+async fn attach_dead_session_returns_error() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("attach-dead");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "dying").await;
+
+    // Wait for shell PID
+    let shell_pid;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let resp = control_request(&ctl_path, Frame::ListSessions).await;
+        match &resp {
+            Frame::SessionInfo { sessions }
+                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
+            {
+                shell_pid = sessions[0].shell_pid;
+                break;
+            }
+            _ if tokio::time::Instant::now() < deadline => continue,
+            other => panic!("shell did not start within 10s, got {other:?}"),
+        }
+    }
+
+    // Kill the shell externally
+    unsafe {
+        libc::kill(shell_pid as i32, libc::SIGKILL);
+    }
+
+    // Wait for server task to notice and exit
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Attach should get an error, not Ok + disconnect
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach {
+            session: id.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, Frame::Error { .. }),
+        "expected Error for dead session attach, got {resp:?}"
+    );
+
+    let _ = std::fs::remove_file(&ctl_path);
+}
+
+/// Regression: killing a session whose shell has already exited should return Error,
+/// not Ok for a stale entry.
+#[tokio::test]
+async fn kill_dead_session_returns_error() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("kill-dead");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "dying2").await;
+
+    // Wait for shell PID
+    let shell_pid;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let resp = control_request(&ctl_path, Frame::ListSessions).await;
+        match &resp {
+            Frame::SessionInfo { sessions }
+                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
+            {
+                shell_pid = sessions[0].shell_pid;
+                break;
+            }
+            _ if tokio::time::Instant::now() < deadline => continue,
+            other => panic!("shell did not start within 10s, got {other:?}"),
+        }
+    }
+
+    // Kill the shell externally
+    unsafe {
+        libc::kill(shell_pid as i32, libc::SIGKILL);
+    }
+
+    // Wait for server task to notice and exit
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Kill should get an error, not Ok for a stale entry
+    let resp = control_request(
+        &ctl_path,
+        Frame::KillSession {
+            session: id.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, Frame::Error { .. }),
+        "expected Error for dead session kill, got {resp:?}"
+    );
+
+    let _ = std::fs::remove_file(&ctl_path);
+}
