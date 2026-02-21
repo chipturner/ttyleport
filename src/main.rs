@@ -94,15 +94,21 @@ async fn new_session(
                 return;
             };
             let mut framed = Framed::new(stream, FrameCodec);
+            let label = if name_for_spawn.is_empty() {
+                None
+            } else {
+                Some(name_for_spawn.clone())
+            };
             let _ = framed
                 .send(Frame::NewSession {
                     name: name_for_spawn,
                 })
                 .await;
             match framed.next().await {
-                Some(Ok(Frame::SessionCreated { id })) => {
-                    eprintln!("session created: id {id}");
-                }
+                Some(Ok(Frame::SessionCreated { id })) => match &label {
+                    Some(n) => eprintln!("session created: {n} (id {id})"),
+                    None => eprintln!("session created: id {id}"),
+                },
                 Some(Ok(Frame::Error { message })) => {
                     eprintln!("error: {message}");
                 }
@@ -149,7 +155,10 @@ async fn new_session(
 
         match framed.next().await {
             Some(Ok(Frame::SessionCreated { id })) => {
-                eprintln!("session created: id {id}");
+                match &name {
+                    Some(n) => eprintln!("session created: {n} (id {id})"),
+                    None => eprintln!("session created: id {id}"),
+                }
                 // Auto-attach: the daemon already handed off our connection to the session
                 let code = ttyleport::client::run(&ctl_path, &id, framed).await?;
                 std::process::exit(code);
@@ -172,7 +181,7 @@ async fn attach(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
 
     let stream = UnixStream::connect(&ctl_path)
         .await
-        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {ctl_path:?})"))?;
+        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display()))?;
     let mut framed = Framed::new(stream, FrameCodec);
     framed
         .send(Frame::Attach {
@@ -206,7 +215,7 @@ async fn daemon_request(
 
     let stream = UnixStream::connect(ctl_path)
         .await
-        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {ctl_path:?})"))?;
+        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display()))?;
     let mut framed = Framed::new(stream, FrameCodec);
     framed.send(frame).await?;
     match framed.next().await {
@@ -219,7 +228,14 @@ async fn daemon_request(
 async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
     use ttyleport::protocol::Frame;
 
-    match daemon_request(&ctl_path, Frame::ListSessions).await? {
+    let resp = match daemon_request(&ctl_path, Frame::ListSessions).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            println!("no active sessions");
+            return Ok(());
+        }
+    };
+    match resp {
         Frame::SessionInfo { sessions } => {
             if sessions.is_empty() {
                 println!("no active sessions");
@@ -232,9 +248,9 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                         format!("{}: {}", s.id, s.name)
                     };
                     if s.shell_pid > 0 {
-                        println!("{label}: {} (pid {}) ({status})", s.pty_path, s.shell_pid);
+                        println!("{label} {} (pid {}) ({status})", s.pty_path, s.shell_pid);
                     } else {
-                        println!("{label}: (starting...)");
+                        println!("{label} (starting...)");
                     }
                 }
             }

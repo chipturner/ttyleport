@@ -178,6 +178,7 @@ async fn relay(
                     }
                     Some(Ok(Frame::Detached)) => {
                         info!("detached by another client");
+                        write_stdout(b"[detached]\r\n")?;
                         return Ok(Some(0));
                     }
                     Some(Ok(_)) => {} // ignore control/resize frames
@@ -235,6 +236,10 @@ pub async fn run(
                         result = reconnect(daemon_socket, session) => {
                             match result {
                                 Ok(f) => break f,
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                                    write_stdout(b"[session ended]\r\n")?;
+                                    return Ok(1);
+                                }
                                 Err(e) => {
                                     debug!("reconnect failed: {e}, retrying...");
                                     tokio::time::sleep(Duration::from_millis(200)).await;
