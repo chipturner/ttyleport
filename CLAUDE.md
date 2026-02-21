@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What is ttyleport
 
 ttyleport teleports a TTY over a Unix domain socket. Single binary, tmux-like CLI:
-- `ttyleport new-session` — creates a persistent session and auto-attaches (auto-starts daemon). Aliases: `new`, `serve`
+- `ttyleport daemon` — starts the daemon in the foreground. Alias: `d`
+- `ttyleport new-session` — creates a persistent session and auto-attaches (requires running daemon). Alias: `new`
 - `ttyleport new-session -t <name>` — creates a named session and auto-attaches
-- `ttyleport new-session --foreground` — runs daemon in foreground (for testing)
 - `ttyleport attach -t <id|name>` — attaches to a session, detaches other clients. Aliases: `a`, `connect`
 - `ttyleport list-sessions` — lists active sessions with id/name/PTY/PID/status. Aliases: `ls`, `list`
 - `ttyleport kill-session -t <id|name>` — kills a specific session
@@ -27,14 +27,15 @@ cargo test                           # all tests (68 total)
 cargo test --test protocol_test      # codec unit tests only (35)
 cargo test --test daemon_test        # daemon integration tests (18)
 cargo test --test e2e_test           # e2e session tests (15)
-cargo run -- new -t myproject        # create named session (auto-starts daemon, auto-attaches)
+cargo run -- daemon &                 # start daemon in background
+cargo run -- new -t myproject        # create named session (requires daemon)
 cargo run -- new                     # create unnamed session (id-only)
 cargo run -- attach -t myproject     # attach to session by name
 cargo run -- attach -t 0             # attach to session by id
 cargo run -- ls                      # list active sessions
 cargo run -- kill-session -t myproject  # kill session by name
 cargo run -- kill-server             # kill daemon
-RUST_LOG=debug cargo run -- new-session --foreground  # debug mode
+RUST_LOG=debug cargo run -- daemon   # debug mode
 tmux start-server\; source-file quicktest.tmux  # manual 2-pane test (server + client)
 ```
 
@@ -64,8 +65,9 @@ Five modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 - **Client takeover**: Inner relay loop also selects on `client_rx.recv()`. New client causes `Detached` to be sent to old client, then relay switches to new connection.
 - **Process group cleanup**: `ManagedChild` drop sends `SIGHUP` to shell's process group via `killpg`.
 - **Terminal state guards**: `RawModeGuard` restores terminal attrs, `NonBlockGuard` restores stdin flags. Drop order ensures `NonBlockGuard` outlives `AsyncFd`.
-- **Daemon auto-start**: `new-session` without `--foreground` checks for running daemon, spawns one in a background thread with a separate tokio runtime if needed, then sends `NewSession` via the daemon socket.
+- **Explicit daemon**: Daemon must be started explicitly via `ttyleport daemon`. `new-session` connects to the running daemon and fails clearly if none is running.
 - **Auto-attach**: After `NewSession` succeeds, the same connection transitions to session relay mode (client calls `client::run` with the existing framed connection).
+- **SIGWINCH on resize**: Server sends explicit `killpg(SIGWINCH)` to the shell's process group after every `TIOCSWINSZ`, ensuring foreground apps redraw on attach even when terminal size hasn't changed.
 - **Session ID resolution**: Given a string, try name match first, then parse as u32 for id match.
 - **Security invariants**: Daemon sets `umask(0o077)` at startup. Sockets are 0600, directories 0700. All `accept()` sites verify `SO_PEERCRED` UID. Frame decoder rejects payloads > 1 MB. Resize values clamped to 1..=10000. `/tmp` fallback directories validated for ownership (not symlinks, owned by current uid).
 

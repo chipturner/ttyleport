@@ -15,16 +15,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Start the daemon (runs in foreground)
+    #[command(alias = "d")]
+    Daemon,
     /// Create a new persistent session (auto-attaches)
-    #[command(alias = "new", alias = "serve")]
+    #[command(alias = "new")]
     NewSession {
         /// Session name (optional; sessions always get an auto-incrementing id)
         #[arg(short = 't', long = "target")]
         target: Option<String>,
-
-        /// Run the daemon in the foreground (don't fork)
-        #[arg(long)]
-        foreground: bool,
     },
     /// Attach to an existing session (detaches other clients)
     #[command(alias = "a", alias = "connect")]
@@ -58,9 +57,8 @@ async fn main() -> anyhow::Result<()> {
         .ctl_socket
         .unwrap_or_else(ttyleport::daemon::control_socket_path);
     match cli.command {
-        Command::NewSession { target, foreground } => {
-            new_session(target, foreground, ctl_path).await
-        }
+        Command::Daemon => ttyleport::daemon::run(&ctl_path).await,
+        Command::NewSession { target } => new_session(target, ctl_path).await,
         Command::Attach { target } => {
             let code = attach(target, ctl_path).await?;
             std::process::exit(code);
@@ -71,11 +69,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn new_session(
-    name: Option<String>,
-    foreground: bool,
-    ctl_path: PathBuf,
-) -> anyhow::Result<()> {
+async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
@@ -83,92 +77,30 @@ async fn new_session(
 
     let session_name = name.clone().unwrap_or_default();
 
-    if foreground {
-        let ctl_for_spawn = ctl_path.clone();
-        let name_for_spawn = session_name.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let stream = UnixStream::connect(&ctl_path)
+        .await
+        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display()))?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed
+        .send(Frame::NewSession {
+            name: session_name,
+        })
+        .await?;
 
-            let Ok(stream) = UnixStream::connect(&ctl_for_spawn).await else {
-                eprintln!("error: failed to connect to daemon control socket");
-                return;
-            };
-            let mut framed = Framed::new(stream, FrameCodec);
-            let label = if name_for_spawn.is_empty() {
-                None
-            } else {
-                Some(name_for_spawn.clone())
-            };
-            let _ = framed
-                .send(Frame::NewSession {
-                    name: name_for_spawn,
-                })
-                .await;
-            match framed.next().await {
-                Some(Ok(Frame::SessionCreated { id })) => match &label {
-                    Some(n) => eprintln!("session created: {n} (id {id})"),
-                    None => eprintln!("session created: id {id}"),
-                },
-                Some(Ok(Frame::Error { message })) => {
-                    eprintln!("error: {message}");
-                }
-                other => {
-                    eprintln!("unexpected response: {other:?}");
-                }
+    match framed.next().await {
+        Some(Ok(Frame::SessionCreated { id })) => {
+            match &name {
+                Some(n) => eprintln!("session created: {n} (id {id})"),
+                None => eprintln!("session created: id {id}"),
             }
-        });
-
-        ttyleport::daemon::run(&ctl_path).await
-    } else {
-        let daemon_running = UnixStream::connect(&ctl_path).await.is_ok();
-
-        if !daemon_running {
-            if let Some(parent) = ctl_path.parent() {
-                ttyleport::security::secure_create_dir_all(parent)?;
-            }
-
-            let ctl = ctl_path.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Err(e) = ttyleport::daemon::run(&ctl).await {
-                        eprintln!("daemon error: {e}");
-                    }
-                });
-            });
-
-            for _ in 0..50 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if UnixStream::connect(&ctl_path).await.is_ok() {
-                    break;
-                }
-            }
+            let code = ttyleport::client::run(&id, framed).await?;
+            std::process::exit(code);
         }
-
-        let stream = UnixStream::connect(&ctl_path).await?;
-        let mut framed = Framed::new(stream, FrameCodec);
-        framed
-            .send(Frame::NewSession {
-                name: session_name,
-            })
-            .await?;
-
-        match framed.next().await {
-            Some(Ok(Frame::SessionCreated { id })) => {
-                match &name {
-                    Some(n) => eprintln!("session created: {n} (id {id})"),
-                    None => eprintln!("session created: id {id}"),
-                }
-                // Auto-attach: the daemon already handed off our connection to the session
-                let code = ttyleport::client::run(&id, framed).await?;
-                std::process::exit(code);
-            }
-            Some(Ok(Frame::Error { message })) => {
-                anyhow::bail!("{message}");
-            }
-            other => {
-                anyhow::bail!("unexpected response from daemon: {other:?}");
-            }
+        Some(Ok(Frame::Error { message })) => {
+            anyhow::bail!("{message}");
+        }
+        other => {
+            anyhow::bail!("unexpected response from daemon: {other:?}");
         }
     }
 }
