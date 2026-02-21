@@ -119,7 +119,14 @@ async fn relay(
     sigwinch: &mut tokio::signal::unix::Signal,
     buf: &mut [u8],
     redraw: bool,
+    env_vars: &[(String, String)],
 ) -> anyhow::Result<Option<i32>> {
+    // Send env vars before resize (server reads Env frame before spawning shell)
+    if !env_vars.is_empty()
+        && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await
+    {
+        return Ok(None);
+    }
     // Send initial window size
     let (cols, rows) = get_terminal_size();
     if !timed_send(framed, Frame::Resize { cols, rows }).await {
@@ -211,6 +218,7 @@ pub async fn run(
     mut framed: Framed<UnixStream, FrameCodec>,
     redraw: bool,
     ctl_path: &Path,
+    env_vars: Vec<(String, String)>,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -227,11 +235,14 @@ pub async fn run(
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
     let mut current_redraw = redraw;
+    let mut current_env = env_vars;
 
     loop {
-        match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, current_redraw).await? {
+        match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, current_redraw, &current_env).await? {
             Some(code) => return Ok(code),
             None => {
+                // Env vars only sent on first connection; clear for reconnect
+                current_env.clear();
                 // Disconnected — try to reconnect
                 write_stdout(b"[reconnecting...]\r\n")?;
 

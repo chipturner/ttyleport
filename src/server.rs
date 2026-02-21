@@ -68,8 +68,7 @@ pub async fn run(
         .map(|p| p.display().to_string())
         .unwrap_or_default();
 
-    // Spawn shell on slave PTY
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    // Dup slave fds for shell stdio (before dropping slave)
     let slave_fd = slave.as_raw_fd();
     let stdin_fd = crate::security::checked_dup(slave_fd)?;
     let stdout_fd = crate::security::checked_dup(slave_fd)?;
@@ -77,17 +76,63 @@ pub async fn run(
     let raw_stdin = stdin_fd.as_raw_fd();
     drop(slave);
 
+    // Set master to non-blocking for AsyncFd
+    let raw_master = master.as_raw_fd();
+    let flags = nix::fcntl::fcntl(raw_master, nix::fcntl::FcntlArg::F_GETFL)?;
+    let mut oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
+    oflags |= nix::fcntl::OFlag::O_NONBLOCK;
+    nix::fcntl::fcntl(raw_master, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
+
+    let async_master = AsyncFd::new(master)?;
+    let mut buf = vec![0u8; 4096];
+
+    // Wait for first client before spawning shell (so we can read Env frame)
+    let mut framed = match client_rx.recv().await {
+        Some(framed) => {
+            info!("first client connected via channel");
+            framed
+        }
+        None => {
+            info!("client channel closed before first client");
+            return Ok(());
+        }
+    };
+
+    // Read optional Env frame from first client (100ms timeout)
+    let env_vars = match tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        framed.next(),
+    )
+    .await
+    {
+        Ok(Some(Ok(Frame::Env { vars }))) => {
+            debug!(count = vars.len(), "received env vars from client");
+            vars
+        }
+        _ => Vec::new(),
+    };
+
+    // Spawn login shell on slave PTY
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let home = std::env::var("HOME").ok();
+    let mut cmd = Command::new(&shell);
+    cmd.arg("-l");
+    if let Some(ref dir) = home {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in &env_vars {
+        cmd.env(k, v);
+    }
     let mut managed = ManagedChild::new(unsafe {
-        Command::new(&shell)
-            .pre_exec(move || {
-                nix::unistd::setsid().map_err(io::Error::other)?;
-                libc::ioctl(raw_stdin, libc::TIOCSCTTY as libc::c_ulong, 0);
-                Ok(())
-            })
-            .stdin(Stdio::from(stdin_fd))
-            .stdout(Stdio::from(stdout_fd))
-            .stderr(Stdio::from(stderr_fd))
-            .spawn()?
+        cmd.pre_exec(move || {
+            nix::unistd::setsid().map_err(io::Error::other)?;
+            libc::ioctl(raw_stdin, libc::TIOCSCTTY as libc::c_ulong, 0);
+            Ok(())
+        })
+        .stdin(Stdio::from(stdin_fd))
+        .stdout(Stdio::from(stdout_fd))
+        .stderr(Stdio::from(stderr_fd))
+        .spawn()?
     });
 
     let shell_pid = managed.child.id().unwrap_or(0);
@@ -104,43 +149,43 @@ pub async fn run(
         last_heartbeat: AtomicU64::new(0),
     });
 
-    // Set master to non-blocking for AsyncFd
-    let raw_master = master.as_raw_fd();
-    let flags = nix::fcntl::fcntl(raw_master, nix::fcntl::FcntlArg::F_GETFL)?;
-    let mut oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
-    oflags |= nix::fcntl::OFlag::O_NONBLOCK;
-    nix::fcntl::fcntl(raw_master, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
-
-    let async_master = AsyncFd::new(master)?;
-    let mut buf = vec![0u8; 4096];
+    // First client is already connected — enter relay directly
+    metadata_slot
+        .get()
+        .unwrap()
+        .attached
+        .store(true, Ordering::Relaxed);
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
+    // First iteration skips client-wait (first client already connected above).
+    let mut first_client = true;
     loop {
-        let framed = tokio::select! {
-            client = client_rx.recv() => {
-                match client {
-                    Some(framed) => {
-                        info!("client connected via channel");
-                        framed
-                    }
-                    None => {
-                        info!("client channel closed");
-                        break;
+        if !first_client {
+            framed = tokio::select! {
+                client = client_rx.recv() => {
+                    match client {
+                        Some(f) => {
+                            info!("client connected via channel");
+                            f
+                        }
+                        None => {
+                            info!("client channel closed");
+                            break;
+                        }
                     }
                 }
-            }
-            status = managed.child.wait() => {
-                let code = status?.code().unwrap_or(1);
-                info!(code, "shell exited while awaiting client");
-                break;
-            }
-        };
+                status = managed.child.wait() => {
+                    let code = status?.code().unwrap_or(1);
+                    info!(code, "shell exited while awaiting client");
+                    break;
+                }
+            };
 
-        if let Some(meta) = metadata_slot.get() {
-            meta.attached.store(true, Ordering::Relaxed);
+            if let Some(meta) = metadata_slot.get() {
+                meta.attached.store(true, Ordering::Relaxed);
+            }
         }
-
-        let mut framed = framed;
+        first_client = false;
 
         // Inner loop: relay between socket and PTY
         let exit = loop {

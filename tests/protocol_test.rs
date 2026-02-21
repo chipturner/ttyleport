@@ -481,3 +481,32 @@ fn roundtrip_pong() {
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(Frame::Pong, decoded);
 }
+
+#[test]
+fn roundtrip_env() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Env {
+        vars: vec![
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("LANG".to_string(), "en_US.UTF-8".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ],
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf[0], 0x07);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_env_empty() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Env { vars: vec![] };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf[0], 0x07);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}

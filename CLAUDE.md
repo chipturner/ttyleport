@@ -23,10 +23,10 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ```bash
 cargo build
-cargo test                           # all tests (74 total)
-cargo test --test protocol_test      # codec unit tests only (37)
+cargo test                           # all tests (78 total)
+cargo test --test protocol_test      # codec unit tests only (39)
 cargo test --test daemon_test        # daemon integration tests (21)
-cargo test --test e2e_test           # e2e session tests (16)
+cargo test --test e2e_test           # e2e session tests (18)
 cargo run -- daemon &                 # start daemon in background
 cargo run -- new -t myproject        # create named session (requires daemon)
 cargo run -- new                     # create unnamed session (id-only)
@@ -47,21 +47,23 @@ Five modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 
 - **`security`** — Shared security utilities. `secure_create_dir_all` (0700 dirs, ownership validation, symlink rejection). `bind_unix_listener` (TOCTOU-safe stale socket handling, 0600 permissions). `verify_peer_uid` (SO_PEERCRED check). `checked_dup` (returns `OwnedFd`). `clamp_winsize`. All socket/directory creation MUST go through this module.
 
-- **`protocol`** — `Frame` enum with session relay types (Data/Resize/Exit/Detached/Ping/Pong), control request types (NewSession/Attach/ListSessions/KillSession/KillServer), and control response types (SessionCreated/SessionInfo/Ok/Error). `SessionEntry` struct carries per-session metadata (id, name, pty_path, shell_pid, created_at, attached, last_heartbeat). Custom tokio-util `Encoder`/`Decoder`. Wire format: `[type: u8][length: u32 BE][payload]`. Session relay: `0x01` Data, `0x02` Resize, `0x03` Exit, `0x04` Detached, `0x05` Ping, `0x06` Pong. Control requests: `0x10` NewSession, `0x11` Attach, `0x12` ListSessions, `0x13` KillSession, `0x14` KillServer. Control responses: `0x20` SessionCreated, `0x21` SessionInfo, `0x22` Ok, `0x23` Error.
+- **`protocol`** — `Frame` enum with session relay types (Data/Resize/Exit/Detached/Ping/Pong/Env), control request types (NewSession/Attach/ListSessions/KillSession/KillServer), and control response types (SessionCreated/SessionInfo/Ok/Error). `SessionEntry` struct carries per-session metadata (id, name, pty_path, shell_pid, created_at, attached, last_heartbeat). Custom tokio-util `Encoder`/`Decoder`. Wire format: `[type: u8][length: u32 BE][payload]`. Session relay: `0x01` Data, `0x02` Resize, `0x03` Exit, `0x04` Detached, `0x05` Ping, `0x06` Pong, `0x07` Env. Control requests: `0x10` NewSession, `0x11` Attach, `0x12` ListSessions, `0x13` KillSession, `0x14` KillServer. Control responses: `0x20` SessionCreated, `0x21` SessionInfo, `0x22` Ok, `0x23` Error.
 
 - **`daemon`** — Listens on a single socket (`$XDG_RUNTIME_DIR/ttyleport/ctl.sock` or `/tmp/ttyleport-$UID/ctl.sock`). Manages sessions in a `HashMap<u32, SessionState>` where `SessionState` holds `JoinHandle` + `Arc<OnceLock<SessionMetadata>>` + `mpsc::UnboundedSender` for client handoff + optional name. Auto-incrementing `next_id` counter. Session resolution: name match first, then numeric id parse. Handles `NewSession` (allocate id, create channel, spawn server, send SessionCreated, hand off framed connection), `Attach` (resolve session, send Ok, hand off), `ListSessions`, `KillSession`, `KillServer`. Reaps finished sessions before each operation.
 
-- **`server`** — `SessionMetadata` struct with pty_path, shell_pid, created_at, `AtomicBool` attached flag, `AtomicU64` last_heartbeat. `ManagedChild` wraps `tokio::process::Child` with process-group cleanup (`killpg(SIGHUP)` on drop). `run()` takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Receives clients via channel (no per-session socket). Inner relay select includes `client_rx.recv()` for client takeover — new client gets the session, old client receives `Detached` frame. Replies `Pong` to `Ping` and updates `last_heartbeat` timestamp.
+- **`server`** — `SessionMetadata` struct with pty_path, shell_pid, created_at, `AtomicBool` attached flag, `AtomicU64` last_heartbeat. `ManagedChild` wraps `tokio::process::Child` with process-group cleanup (`killpg(SIGHUP)` on drop). `run()` takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Deferred shell spawn: allocates PTY early, waits for first client, reads optional `Env` frame (100ms timeout), then spawns login shell (`-l`) with `CWD=$HOME` and forwarded env vars. Receives clients via channel (no per-session socket). Inner relay select includes `client_rx.recv()` for client takeover — new client gets the session, old client receives `Detached` frame. Replies `Pong` to `Ping` and updates `last_heartbeat` timestamp.
 
-- **`client`** — `NonBlockGuard` saves/restores stdin's `O_NONBLOCK` flag on drop (prevents breaking parent shell). `RawModeGuard` saves/restores terminal mode. `run()` takes session id/name, initial framed connection, redraw flag, and `ctl_path` for reconnect. Sends `Ping` every 5s; if no `Pong` within 15s, treats connection as dead. On disconnect/timeout, auto-reconnects via `ctl_path` (connect → Attach → resume relay). Prints `[reconnecting...]` / `[reconnected]` during the loop. Ctrl-C (0x03 in raw mode) exits during reconnect. Handles `Detached` frame with `[detached]` message (no reconnect on detach).
+- **`client`** — `NonBlockGuard` saves/restores stdin's `O_NONBLOCK` flag on drop (prevents breaking parent shell). `RawModeGuard` saves/restores terminal mode. `run()` takes session id/name, initial framed connection, redraw flag, `ctl_path` for reconnect, and `env_vars: Vec<(String, String)>`. On first relay, sends `Env` frame (if non-empty) then `Resize`; on reconnect sends only `Resize` (env_vars cleared). Sends `Ping` every 5s; if no `Pong` within 15s, treats connection as dead. On disconnect/timeout, auto-reconnects via `ctl_path` (connect → Attach → resume relay). Prints `[reconnecting...]` / `[reconnected]` during the loop. Ctrl-C (0x03 in raw mode) exits during reconnect. Handles `Detached` frame with `[detached]` message (no reconnect on detach).
 
 ## Patterns
 
 - **Single-socket connection handoff**: Daemon reads first frame, routes. For NewSession/Attach, daemon transfers the `Framed<UnixStream>` to the session task via `mpsc` channel. Daemon no longer touches that socket.
 - **AsyncFd + try_io**: PTY master and stdin are raw fds wrapped in `AsyncFd`. Reads/writes use `guard.try_io()` with would-block continuation (`Err(_) => continue`).
 - **Framed codec**: Socket I/O uses `tokio_util::codec::Framed<UnixStream, FrameCodec>` with `SinkExt`/`StreamExt` from futures-util.
-- **PTY lifecycle**: `openpty` then fork with `pre_exec(setsid + TIOCSCTTY)` then drop slave in parent then relay on master. EIO means shell exited.
-- **Persistent sessions**: PTY spawns once before the accept loop. Client disconnect breaks the inner relay loop only; outer loop re-accepts via channel. While disconnected, shell blocks on full kernel PTY buffer (~4KB) and resumes on reconnect.
+- **PTY lifecycle**: `openpty` then defer shell spawn until first client connects. Read optional `Env` frame, then fork with `pre_exec(setsid + TIOCSCTTY)` using `-l` (login shell) and `CWD=$HOME`. Drop slave in parent then relay on master. EIO means shell exited.
+- **Deferred shell spawn**: PTY is allocated early but shell spawn waits for first client so the server can read the `Env` frame and apply env vars. First client feeds directly into the relay loop (no re-wait in the outer loop).
+- **Client environment forwarding**: Client sends `Env` frame with TERM/LANG/COLORTERM before the first `Resize` on new sessions. Server applies these as env vars when spawning the shell. On reconnect/attach, no `Env` frame is sent (shell already running).
+- **Persistent sessions**: PTY spawns once after the first client connects. Client disconnect breaks the inner relay loop only; outer loop re-accepts via channel. While disconnected, shell blocks on full kernel PTY buffer (~4KB) and resumes on reconnect.
 - **Client takeover**: Inner relay loop also selects on `client_rx.recv()`. New client causes `Detached` to be sent to old client, then relay switches to new connection.
 - **Process group cleanup**: `ManagedChild` drop sends `SIGHUP` to shell's process group via `killpg`.
 - **Terminal state guards**: `RawModeGuard` restores terminal attrs, `NonBlockGuard` restores stdin flags. Drop order ensures `NonBlockGuard` outlives `AsyncFd`.
@@ -76,11 +78,11 @@ Five modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Ping/Pong heartbeat with auto-reconnect. All modules implemented and tested (74 tests: 37 protocol codec + 16 e2e session + 21 daemon integration).
+Full CLI with tmux-like ergonomics. Single-socket architecture. Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. All modules implemented and tested (78 tests: 39 protocol codec + 18 e2e session + 21 daemon integration).
 
 ## Development Notes
 
-- **`client::run()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>` + `redraw: bool` + `ctl_path: &Path`. Called from `new_session()` (redraw=false) and `attach()` (redraw=!no_redraw) in main.rs. The `ctl_path` enables auto-reconnect.
+- **`client::run()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>` + `redraw: bool` + `ctl_path: &Path` + `env_vars: Vec<(String, String)>`. Called from `new_session()` (redraw=false, env_vars=[TERM,LANG,COLORTERM]) and `attach()` (redraw=!no_redraw, env_vars=[]) in main.rs. The `ctl_path` enables auto-reconnect.
 - **`server::run()` signature** — takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Called directly by e2e tests (via `UnixStream::pair()` + channel) and spawned by daemon. Changing its signature requires updating both.
 - **`Frame` enum changes** — adding variants requires updating: encoder, decoder, protocol tests, and all `match frame` sites in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo` wire format** — 7 tab-separated fields per line: `id\tname\tpty_path\tshell_pid\tcreated_at\tattached\tlast_heartbeat`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.

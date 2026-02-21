@@ -8,6 +8,7 @@ const TYPE_EXIT: u8 = 0x03;
 const TYPE_DETACHED: u8 = 0x04;
 const TYPE_PING: u8 = 0x05;
 const TYPE_PONG: u8 = 0x06;
+const TYPE_ENV: u8 = 0x07;
 const TYPE_NEW_SESSION: u8 = 0x10;
 const TYPE_ATTACH: u8 = 0x11;
 const TYPE_LIST_SESSIONS: u8 = 0x12;
@@ -49,6 +50,8 @@ pub enum Frame {
     Ping,
     /// Heartbeat reply (server → client).
     Pong,
+    /// Environment variables (client → server, sent before first Resize on new session).
+    Env { vars: Vec<(String, String)> },
     // Control requests
     NewSession {
         name: String,
@@ -129,6 +132,21 @@ impl Decoder for FrameCodec {
             TYPE_DETACHED => Ok(Some(Frame::Detached)),
             TYPE_PING => Ok(Some(Frame::Ping)),
             TYPE_PONG => Ok(Some(Frame::Pong)),
+            TYPE_ENV => {
+                let text = String::from_utf8(payload.to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let vars = if text.is_empty() {
+                    Vec::new()
+                } else {
+                    text.lines()
+                        .filter_map(|line| {
+                            let (k, v) = line.split_once('=')?;
+                            Some((k.to_string(), v.to_string()))
+                        })
+                        .collect()
+                };
+                Ok(Some(Frame::Env { vars }))
+            }
             TYPE_NEW_SESSION => {
                 let name = String::from_utf8(payload.to_vec())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -224,6 +242,16 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Pong => {
                 dst.put_u8(TYPE_PONG);
                 dst.put_u32(0);
+            }
+            Frame::Env { vars } => {
+                let text: String = vars
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                dst.put_u8(TYPE_ENV);
+                dst.put_u32(text.len() as u32);
+                dst.extend_from_slice(text.as_bytes());
             }
             Frame::NewSession { name } => {
                 dst.put_u8(TYPE_NEW_SESSION);

@@ -34,6 +34,36 @@ async fn setup_session() -> (
     (client_tx, framed, handle, meta)
 }
 
+/// Spawn a server task, send an Env frame before the first Resize.
+/// Returns same tuple as setup_session().
+async fn setup_session_with_env(
+    env_vars: Vec<(String, String)>,
+) -> (
+    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    Framed<UnixStream, FrameCodec>,
+    JoinHandle<anyhow::Result<()>>,
+    Arc<OnceLock<ttyleport::server::SessionMetadata>>,
+) {
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let meta = Arc::new(OnceLock::new());
+    let meta_clone = Arc::clone(&meta);
+    let handle = tokio::spawn(async move { ttyleport::server::run(client_rx, meta_clone).await });
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    // Send Env frame so server reads it before spawning shell
+    framed
+        .send(Frame::Env { vars: env_vars })
+        .await
+        .unwrap();
+
+    (client_tx, framed, handle, meta)
+}
+
 /// Wait for shell to produce initial output (confirms it's alive).
 async fn wait_for_shell(framed: &mut Framed<UnixStream, FrameCodec>) {
     // Send initial resize
@@ -608,6 +638,56 @@ async fn ping_pong_heartbeat() {
         .last_heartbeat
         .load(std::sync::atomic::Ordering::Relaxed);
     assert!(hb > 0, "last_heartbeat should be updated after Ping");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn env_vars_forwarded() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta) = setup_session_with_env(vec![
+        ("TERM".to_string(), "xterm-test-42".to_string()),
+    ])
+    .await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    framed
+        .send(Frame::Data(Bytes::from("echo $TERM\n")))
+        .await
+        .unwrap();
+
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("xterm-test-42"),
+        "expected forwarded TERM in output, got: {output_str}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn login_shell_starts_in_home() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    framed
+        .send(Frame::Data(Bytes::from("pwd\n")))
+        .await
+        .unwrap();
+
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    let home = std::env::var("HOME").unwrap();
+    assert!(
+        output_str.contains(&home),
+        "expected CWD to be $HOME ({home}), got: {output_str}"
+    );
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

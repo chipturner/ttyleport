@@ -111,7 +111,11 @@ async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<
                 Some(n) => eprintln!("session created: {n} (id {id})"),
                 None => eprintln!("session created: id {id}"),
             }
-            let code = ttyleport::client::run(&id, framed, false, &ctl_path).await?;
+            let env_vars: Vec<(String, String)> = ["TERM", "LANG", "COLORTERM"]
+                .iter()
+                .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+                .collect();
+            let code = ttyleport::client::run(&id, framed, false, &ctl_path, env_vars).await?;
             std::process::exit(code);
         }
         Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
@@ -146,7 +150,7 @@ async fn attach(target: String, redraw: bool, ctl_path: PathBuf) -> anyhow::Resu
     match framed.next().await {
         Some(Ok(Frame::Ok)) => {
             eprintln!("[attached]");
-            let code = ttyleport::client::run(&target, framed, redraw, &ctl_path).await?;
+            let code = ttyleport::client::run(&target, framed, redraw, &ctl_path, vec![]).await?;
             Ok(code)
         }
         Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
