@@ -58,6 +58,25 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Write all bytes to stdout, retrying on WouldBlock.
+/// Needed because setting O_NONBLOCK on stdin also affects stdout
+/// when they share the same terminal file description.
+fn write_stdout(data: &[u8]) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    let mut written = 0;
+    while written < data.len() {
+        match stdout.write(&data[written..]) {
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    stdout.flush()
+}
+
 fn get_terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
@@ -135,8 +154,7 @@ async fn relay(
                 match frame {
                     Some(Ok(Frame::Data(data))) => {
                         debug!(len = data.len(), "socket → stdout");
-                        io::stdout().write_all(&data)?;
-                        io::stdout().flush()?;
+                        write_stdout(&data)?;
                     }
                     Some(Ok(Frame::Exit { code })) => {
                         info!(code, "server sent exit");
