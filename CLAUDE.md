@@ -23,7 +23,7 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ```bash
 cargo build
-cargo test                           # all tests (78 total)
+cargo test                           # all tests (95 total)
 cargo test --test protocol_test      # codec unit tests only (39)
 cargo test --test daemon_test        # daemon integration tests (21)
 cargo test --test e2e_test           # e2e session tests (18)
@@ -53,7 +53,7 @@ Five modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 
 - **`server`** — `SessionMetadata` struct with pty_path, shell_pid, created_at, `AtomicBool` attached flag, `AtomicU64` last_heartbeat. `ManagedChild` wraps `tokio::process::Child` with process-group cleanup (`killpg(SIGHUP)` on drop). `run()` takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Deferred shell spawn: allocates PTY early, waits for first client, reads optional `Env` frame (100ms timeout), then spawns login shell (`-l`) with `CWD=$HOME` and forwarded env vars. Receives clients via channel (no per-session socket). Inner relay select includes `client_rx.recv()` for client takeover — new client gets the session, old client receives `Detached` frame. Replies `Pong` to `Ping` and updates `last_heartbeat` timestamp.
 
-- **`client`** — `NonBlockGuard` saves/restores stdin's `O_NONBLOCK` flag on drop (prevents breaking parent shell). `RawModeGuard` saves/restores terminal mode. `run()` takes session id/name, initial framed connection, redraw flag, `ctl_path` for reconnect, and `env_vars: Vec<(String, String)>`. On first relay, sends `Env` frame (if non-empty) then `Resize`; on reconnect sends only `Resize` (env_vars cleared). Sends `Ping` every 5s; if no `Pong` within 15s, treats connection as dead. On disconnect/timeout, auto-reconnects via `ctl_path` (connect → Attach → resume relay). Prints `[reconnecting...]` / `[reconnected]` during the loop. Ctrl-C (0x03 in raw mode) exits during reconnect. Handles `Detached` frame with `[detached]` message (no reconnect on detach).
+- **`client`** — `NonBlockGuard` saves/restores stdin's `O_NONBLOCK` flag on drop (prevents breaking parent shell). `RawModeGuard` saves/restores terminal mode. `EscapeProcessor` implements SSH-style `~` escape sequences (detach/suspend/help). `run()` takes session id/name, initial framed connection, redraw flag, `ctl_path` for reconnect, `env_vars: Vec<(String, String)>`, and `no_escape: bool`. On first relay, sends `Env` frame (if non-empty) then `Resize`; on reconnect sends only `Resize` (env_vars cleared). Sends `Ping` every 5s; if no `Pong` within 15s, treats connection as dead. On disconnect/timeout, auto-reconnects via `ctl_path` (connect → Attach → resume relay). Prints `[reconnecting...]` / `[reconnected]` during the loop. Ctrl-C (0x03 in raw mode) exits during reconnect. Handles `Detached` frame with `[detached]` message (no reconnect on detach).
 
 ## Patterns
 
@@ -74,15 +74,16 @@ Five modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 - **Ping/Pong heartbeat**: Client sends `Ping` every 5s, server replies `Pong` immediately and updates `last_heartbeat` in `SessionMetadata`. If client gets no `Pong` within 15s, connection is considered dead and client enters auto-reconnect loop. Zero-payload frames — 5 bytes on wire each.
 - **Auto-reconnect**: On heartbeat timeout or disconnect, client loops: sleep 1s → connect to `ctl_path` → send `Attach` → read response. Terminal stays in raw mode throughout. Ctrl-C (0x03) during reconnect exits. On success, relay resumes with `redraw: true`. On `Frame::Error` (session gone), exits cleanly.
 - **Session ID resolution**: Given a string, try name match first, then parse as u32 for id match.
+- **SSH-style escape sequences**: `~` after newline (or at session start) enters escape mode. `~.` detaches (clean exit, no reconnect), `~^Z` suspends client (SIGTSTP), `~?` prints help, `~~` sends literal `~`. Unrecognized command flushes tilde + byte to server. `EscapeProcessor` state machine with 3 states (Normal/AfterNewline/AfterTilde). Disabled with `--no-escape` CLI flag. 17 unit tests in `client::tests`.
 - **Security invariants**: Daemon sets `umask(0o077)` at startup. Sockets are 0600, directories 0700. All `accept()` sites verify `SO_PEERCRED` UID. Frame decoder rejects payloads > 1 MB. Resize values clamped to 1..=10000. `/tmp` fallback directories validated for ownership (not symlinks, owned by current uid).
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. All modules implemented and tested (78 tests: 39 protocol codec + 18 e2e session + 21 daemon integration).
+Full CLI with tmux-like ergonomics. Single-socket architecture. Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). All modules implemented and tested (95 tests: 17 escape processor + 39 protocol codec + 18 e2e session + 21 daemon integration).
 
 ## Development Notes
 
-- **`client::run()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>` + `redraw: bool` + `ctl_path: &Path` + `env_vars: Vec<(String, String)>`. Called from `new_session()` (redraw=false, env_vars=[TERM,LANG,COLORTERM]) and `attach()` (redraw=!no_redraw, env_vars=[]) in main.rs. The `ctl_path` enables auto-reconnect.
+- **`client::run()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>` + `redraw: bool` + `ctl_path: &Path` + `env_vars: Vec<(String, String)>` + `no_escape: bool`. Called from `new_session()` (redraw=false, env_vars=[TERM,LANG,COLORTERM], no_escape from CLI) and `attach()` (redraw=!no_redraw, env_vars=[], no_escape from CLI) in main.rs. The `ctl_path` enables auto-reconnect.
 - **`server::run()` signature** — takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Called directly by e2e tests (via `UnixStream::pair()` + channel) and spawned by daemon. Changing its signature requires updating both.
 - **`Frame` enum changes** — adding variants requires updating: encoder, decoder, protocol tests, and all `match frame` sites in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo` wire format** — 7 tab-separated fields per line: `id\tname\tpty_path\tshell_pid\tcreated_at\tattached\tlast_heartbeat`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.

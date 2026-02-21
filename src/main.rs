@@ -24,6 +24,10 @@ enum Command {
         /// Session name (optional; sessions always get an auto-incrementing id)
         #[arg(short = 't', long = "target")]
         target: Option<String>,
+
+        /// Disable escape sequences (~. detach, ~? help, etc.)
+        #[arg(long)]
+        no_escape: bool,
     },
     /// Attach to an existing session (detaches other clients)
     #[command(alias = "a", alias = "connect")]
@@ -35,6 +39,10 @@ enum Command {
         /// Don't send Ctrl-L to redraw after attaching
         #[arg(long)]
         no_redraw: bool,
+
+        /// Disable escape sequences (~. detach, ~? help, etc.)
+        #[arg(long)]
+        no_escape: bool,
     },
     /// List active sessions
     #[command(alias = "ls", alias = "list")]
@@ -72,9 +80,9 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(ttyleport::daemon::control_socket_path);
     match cli.command {
         Command::Daemon => ttyleport::daemon::run(&ctl_path).await,
-        Command::NewSession { target } => new_session(target, ctl_path).await,
-        Command::Attach { target, no_redraw } => {
-            let code = attach(target, !no_redraw, ctl_path).await?;
+        Command::NewSession { target, no_escape } => new_session(target, no_escape, ctl_path).await,
+        Command::Attach { target, no_redraw, no_escape } => {
+            let code = attach(target, !no_redraw, no_escape, ctl_path).await?;
             std::process::exit(code);
         }
         Command::ListSessions => list_sessions(ctl_path).await,
@@ -87,7 +95,7 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
-async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<()> {
+async fn new_session(name: Option<String>, no_escape: bool, ctl_path: PathBuf) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
@@ -115,7 +123,7 @@ async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<
                 .iter()
                 .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
                 .collect();
-            let code = ttyleport::client::run(&id, framed, false, &ctl_path, env_vars).await?;
+            let code = ttyleport::client::run(&id, framed, false, &ctl_path, env_vars, no_escape).await?;
             std::process::exit(code);
         }
         Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
@@ -125,7 +133,7 @@ async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<
     }
 }
 
-async fn attach(target: String, redraw: bool, ctl_path: PathBuf) -> anyhow::Result<i32> {
+async fn attach(target: String, redraw: bool, no_escape: bool, ctl_path: PathBuf) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
@@ -150,7 +158,7 @@ async fn attach(target: String, redraw: bool, ctl_path: PathBuf) -> anyhow::Resu
     match framed.next().await {
         Some(Ok(Frame::Ok)) => {
             eprintln!("[attached]");
-            let code = ttyleport::client::run(&target, framed, redraw, &ctl_path, vec![]).await?;
+            let code = ttyleport::client::run(&target, framed, redraw, &ctl_path, vec![], no_escape).await?;
             Ok(code)
         }
         Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),

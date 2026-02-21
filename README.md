@@ -70,8 +70,18 @@ Close your laptop, switch networks, reconnect SSH — the client detects the dea
 **Tip:** Use [autossh](https://www.harding.motd.ca/autossh/) to keep the SSH tunnel alive automatically:
 
 ```bash
-autossh -M 0 -L /tmp/ttyleport-remote.sock:$REMOTE_SOCK user@remote-host -N
+AUTOSSH_GATETIME=0 \
+autossh -M 0 \
+  -o ServerAliveInterval=3 -o ServerAliveCountMax=2 \
+  -o StreamLocalBindUnlink=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ConnectTimeout=5 \
+  -N -T \
+  -L /tmp/ttyleport-remote.sock:$REMOTE_SOCK \
+  user@remote-host
 ```
+
+`ServerAliveInterval=3` and `ServerAliveCountMax=2` detect a dead connection in 6 seconds — well under ttyleport's 15-second heartbeat timeout, so most network blips heal transparently. `StreamLocalBindUnlink=yes` removes the stale socket on reconnect so the new tunnel can bind. `AUTOSSH_GATETIME=0` retries immediately on failure.
 
 ## Commands
 

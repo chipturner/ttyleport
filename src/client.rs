@@ -13,6 +13,126 @@ use tokio::time::Instant;
 use tokio_util::codec::Framed;
 use tracing::{debug, info};
 
+// --- Escape sequence processing (SSH-style ~. detach, ~^Z suspend, ~? help) ---
+
+const ESCAPE_HELP: &[u8] = b"\r\nSupported escape sequences:\r\n\
+    ~.  - detach from session\r\n\
+    ~^Z - suspend client\r\n\
+    ~?  - this message\r\n\
+    ~~  - send the escape character by typing it twice\r\n\
+(Note that escapes are only recognized immediately after newline.)\r\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeState {
+    Normal,
+    AfterNewline,
+    AfterTilde,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EscapeAction {
+    Data(Vec<u8>),
+    Detach,
+    Suspend,
+    Help,
+}
+
+struct EscapeProcessor {
+    state: EscapeState,
+}
+
+impl EscapeProcessor {
+    fn new() -> Self {
+        Self {
+            state: EscapeState::AfterNewline,
+        }
+    }
+
+    fn process(&mut self, input: &[u8]) -> Vec<EscapeAction> {
+        let mut actions = Vec::new();
+        let mut data_buf = Vec::new();
+
+        for &b in input {
+            match self.state {
+                EscapeState::Normal => {
+                    if b == b'\n' || b == b'\r' {
+                        self.state = EscapeState::AfterNewline;
+                    }
+                    data_buf.push(b);
+                }
+                EscapeState::AfterNewline => {
+                    if b == b'~' {
+                        self.state = EscapeState::AfterTilde;
+                        // Buffer the tilde — don't send yet
+                        if !data_buf.is_empty() {
+                            actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
+                        }
+                    } else if b == b'\n' || b == b'\r' {
+                        // Stay in AfterNewline
+                        data_buf.push(b);
+                    } else {
+                        self.state = EscapeState::Normal;
+                        data_buf.push(b);
+                    }
+                }
+                EscapeState::AfterTilde => {
+                    match b {
+                        b'.' => {
+                            if !data_buf.is_empty() {
+                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
+                            }
+                            actions.push(EscapeAction::Detach);
+                            return actions; // Stop processing
+                        }
+                        0x1a => {
+                            // Ctrl-Z
+                            if !data_buf.is_empty() {
+                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
+                            }
+                            actions.push(EscapeAction::Suspend);
+                            self.state = EscapeState::Normal;
+                        }
+                        b'?' => {
+                            if !data_buf.is_empty() {
+                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
+                            }
+                            actions.push(EscapeAction::Help);
+                            self.state = EscapeState::Normal;
+                        }
+                        b'~' => {
+                            // Literal tilde
+                            data_buf.push(b'~');
+                            self.state = EscapeState::Normal;
+                        }
+                        b'\n' | b'\r' => {
+                            // Flush buffered tilde + this byte
+                            data_buf.push(b'~');
+                            data_buf.push(b);
+                            self.state = EscapeState::AfterNewline;
+                        }
+                        _ => {
+                            // Unknown — flush tilde + byte
+                            data_buf.push(b'~');
+                            data_buf.push(b);
+                            self.state = EscapeState::Normal;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !data_buf.is_empty() {
+            actions.push(EscapeAction::Data(data_buf));
+        }
+        actions
+    }
+}
+
+fn suspend() -> anyhow::Result<()> {
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(0), nix::sys::signal::Signal::SIGTSTP)?;
+    Ok(())
+}
+
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct NonBlockGuard {
@@ -120,6 +240,7 @@ async fn relay(
     buf: &mut [u8],
     redraw: bool,
     env_vars: &[(String, String)],
+    mut escape: Option<&mut EscapeProcessor>,
 ) -> anyhow::Result<Option<i32>> {
     // Send env vars before resize (server reads Env frame before spawning shell)
     if !env_vars.is_empty()
@@ -152,7 +273,32 @@ async fn relay(
                     }
                     Ok(Ok(n)) => {
                         debug!(len = n, "stdin → socket");
-                        if !timed_send(framed, Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await {
+                        if let Some(ref mut esc) = escape {
+                            for action in esc.process(&buf[..n]) {
+                                match action {
+                                    EscapeAction::Data(data) => {
+                                        if !timed_send(framed, Frame::Data(Bytes::from(data))).await {
+                                            return Ok(None);
+                                        }
+                                    }
+                                    EscapeAction::Detach => {
+                                        write_stdout(b"\r\n[detached]\r\n")?;
+                                        return Ok(Some(0));
+                                    }
+                                    EscapeAction::Suspend => {
+                                        suspend()?;
+                                        // Re-sync terminal size after resume
+                                        let (cols, rows) = get_terminal_size();
+                                        if !timed_send(framed, Frame::Resize { cols, rows }).await {
+                                            return Ok(None);
+                                        }
+                                    }
+                                    EscapeAction::Help => {
+                                        write_stdout(ESCAPE_HELP)?;
+                                    }
+                                }
+                            }
+                        } else if !timed_send(framed, Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await {
                             return Ok(None);
                         }
                     }
@@ -219,6 +365,7 @@ pub async fn run(
     redraw: bool,
     ctl_path: &Path,
     env_vars: Vec<(String, String)>,
+    no_escape: bool,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -236,9 +383,10 @@ pub async fn run(
     let mut buf = vec![0u8; 4096];
     let mut current_redraw = redraw;
     let mut current_env = env_vars;
+    let mut escape = if no_escape { None } else { Some(EscapeProcessor::new()) };
 
     loop {
-        match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, current_redraw, &current_env).await? {
+        match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, current_redraw, &current_env, escape.as_mut()).await? {
             Some(code) => return Ok(code),
             None => {
                 // Env vars only sent on first connection; clear for reconnect
@@ -294,5 +442,175 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_passthrough() {
+        let mut ep = EscapeProcessor::new();
+        // No newlines — after initial AfterNewline, 'h' transitions to Normal
+        let actions = ep.process(b"hello");
+        assert_eq!(actions, vec![EscapeAction::Data(b"hello".to_vec())]);
+    }
+
+    #[test]
+    fn tilde_after_newline_detach() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~.");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Detach,
+        ]);
+    }
+
+    #[test]
+    fn tilde_after_cr_detach() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\r~.");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\r".to_vec()),
+            EscapeAction::Detach,
+        ]);
+    }
+
+    #[test]
+    fn tilde_not_after_newline() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"a~.");
+        assert_eq!(actions, vec![EscapeAction::Data(b"a~.".to_vec())]);
+    }
+
+    #[test]
+    fn initial_state_detach() {
+        let mut ep = EscapeProcessor::new();
+        let actions = ep.process(b"~.");
+        assert_eq!(actions, vec![EscapeAction::Detach]);
+    }
+
+    #[test]
+    fn tilde_suspend() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~\x1a");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Suspend,
+        ]);
+    }
+
+    #[test]
+    fn tilde_help() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~?");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Help,
+        ]);
+    }
+
+    #[test]
+    fn double_tilde() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~~");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Data(b"~".to_vec()),
+        ]);
+        assert_eq!(ep.state, EscapeState::Normal);
+    }
+
+    #[test]
+    fn tilde_unknown_char() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~x");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Data(b"~x".to_vec()),
+        ]);
+    }
+
+    #[test]
+    fn split_across_reads() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let a1 = ep.process(b"\n");
+        assert_eq!(a1, vec![EscapeAction::Data(b"\n".to_vec())]);
+        let a2 = ep.process(b"~");
+        assert_eq!(a2, vec![]); // tilde buffered
+        let a3 = ep.process(b".");
+        assert_eq!(a3, vec![EscapeAction::Detach]);
+    }
+
+    #[test]
+    fn split_tilde_then_normal() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let a1 = ep.process(b"\n");
+        assert_eq!(a1, vec![EscapeAction::Data(b"\n".to_vec())]);
+        let a2 = ep.process(b"~");
+        assert_eq!(a2, vec![]);
+        let a3 = ep.process(b"a");
+        assert_eq!(a3, vec![EscapeAction::Data(b"~a".to_vec())]);
+    }
+
+    #[test]
+    fn multiple_escapes_one_buffer() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~?\n~.");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Help,
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Detach,
+        ]);
+    }
+
+    #[test]
+    fn consecutive_newlines() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n\n\n~.");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n\n\n".to_vec()),
+            EscapeAction::Detach,
+        ]);
+    }
+
+    #[test]
+    fn detach_stops_processing() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~.remaining");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Detach,
+        ]);
+    }
+
+    #[test]
+    fn tilde_then_newline() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~\n");
+        assert_eq!(actions, vec![
+            EscapeAction::Data(b"\n".to_vec()),
+            EscapeAction::Data(b"~\n".to_vec()),
+        ]);
+        assert_eq!(ep.state, EscapeState::AfterNewline);
+    }
+
+    #[test]
+    fn empty_input() {
+        let mut ep = EscapeProcessor::new();
+        let actions = ep.process(b"");
+        assert_eq!(actions, vec![]);
+    }
+
+    #[test]
+    fn only_tilde_buffered() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let a1 = ep.process(b"\n~");
+        assert_eq!(a1, vec![EscapeAction::Data(b"\n".to_vec())]);
+        assert_eq!(ep.state, EscapeState::AfterTilde);
+        let a2 = ep.process(b".");
+        assert_eq!(a2, vec![EscapeAction::Detach]);
     }
 }
