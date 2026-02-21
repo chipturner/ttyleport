@@ -104,8 +104,11 @@ Early stage. Works on Linux. Not yet packaged for distribution.
 
 ## Roadmap
 
-- **Zero-downtime upgrades** — daemon re-execs itself with a new binary, preserving sessions and child processes across upgrades
+- **SSH wrapper** — `ttyleport connect user@host` that handles socket forwarding, remote daemon startup, and attach in one command
+- **Detach key** — configurable key sequence (e.g. `~.`) to cleanly detach from a session without killing the client
 - **Daemon auto-start** — start the daemon on demand (systemd socket activation, launchd, or on first `new-session`)
+- **Zero-downtime upgrades** — daemon re-execs itself with a new binary, preserving sessions and child processes across upgrades
+- **Read-only attach** — multiple clients viewing the same session for pair programming or demos
 
 ## License
 
