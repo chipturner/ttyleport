@@ -102,6 +102,11 @@ The client sends a Ping frame every 5 seconds. The server replies with Pong. If 
 
 Early stage. Works on Linux. Not yet packaged for distribution.
 
+## Roadmap
+
+- **Zero-downtime upgrades** — daemon re-execs itself with a new binary, preserving sessions and child processes across upgrades
+- **Daemon auto-start** — start the daemon on demand (systemd socket activation, launchd, or on first `new-session`)
+
 ## License
 
 MIT OR Apache-2.0
