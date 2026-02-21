@@ -658,3 +658,65 @@ async fn client_explicit_exit_frame() {
     let _ = timeout(Duration::from_secs(3), server).await;
     let _ = std::fs::remove_file(&socket_path);
 }
+
+#[tokio::test]
+async fn high_throughput_data_relay() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    // Pump ~2MB through the session to stress-test the relay path.
+    // Catches WouldBlock errors on non-blocking stdout and buffer issues.
+    let socket_path = unique_sock("throughput");
+    let _ = std::fs::remove_file(&socket_path);
+
+    let path = socket_path.clone();
+    let server =
+        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
+
+    let mut framed = connect_to_server(&socket_path).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Generate ~2MB of output, then print a marker we can check for.
+    framed
+        .send(Frame::Data(Bytes::from(
+            "head -c 2000000 /dev/urandom | base64; echo THROUGHPUT_DONE\n",
+        )))
+        .await
+        .unwrap();
+
+    // Drain all output with a generous timeout for the large payload
+    let mut total = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match timeout(Duration::from_secs(2), framed.next()).await {
+            Ok(Some(Ok(Frame::Data(data)))) => total.extend_from_slice(&data),
+            _ => {
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let s = String::from_utf8_lossy(&total);
+                if s.contains("THROUGHPUT_DONE") {
+                    break;
+                }
+                continue;
+            }
+        }
+    }
+
+    let output_str = String::from_utf8_lossy(&total);
+    assert!(
+        output_str.contains("THROUGHPUT_DONE"),
+        "expected throughput marker, got {} bytes (last 100: {})",
+        total.len(),
+        &output_str[output_str.len().saturating_sub(100)..],
+    );
+
+    // base64 of 2MB produces ~2.67MB; verify we got a substantial amount
+    assert!(
+        total.len() > 1_000_000,
+        "expected >1MB of output, got {} bytes",
+        total.len(),
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+    let _ = std::fs::remove_file(&socket_path);
+}
