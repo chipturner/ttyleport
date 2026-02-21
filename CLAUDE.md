@@ -52,7 +52,7 @@ Five modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`
 
 - **`server`** — `SessionMetadata` struct with pty_path, shell_pid, created_at, `AtomicBool` attached flag. `ManagedChild` wraps `tokio::process::Child` with process-group cleanup (`killpg(SIGHUP)` on drop). `run()` takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Receives clients via channel (no per-session socket). Inner relay select includes `client_rx.recv()` for client takeover — new client gets the session, old client receives `Detached` frame.
 
-- **`client`** — `NonBlockGuard` saves/restores stdin's `O_NONBLOCK` flag on drop (prevents breaking parent shell). `RawModeGuard` saves/restores terminal mode. `run()` takes daemon socket path, session id/name, and initial framed connection. Handles `Detached` frame as clean exit (no reconnect). Auto-reconnects on server disconnect by connecting to daemon and sending `Attach`.
+- **`client`** — `NonBlockGuard` saves/restores stdin's `O_NONBLOCK` flag on drop (prevents breaking parent shell). `RawModeGuard` saves/restores terminal mode. `run()` takes session id/name and initial framed connection. Handles `Detached` frame with `[detached]` message. On unexpected disconnect, prints `[disconnected]` with reconnect command and exits (no auto-reconnect).
 
 ## Patterns
 
@@ -75,6 +75,7 @@ Full CLI with tmux-like ergonomics. Single-socket architecture. All modules impl
 
 ## Development Notes
 
+- **`client::run()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>`. Called from `new_session()` and `attach()` in main.rs.
 - **`server::run()` signature** — takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Called directly by e2e tests (via `UnixStream::pair()` + channel) and spawned by daemon. Changing its signature requires updating both.
 - **`Frame` enum changes** — adding variants requires updating: encoder, decoder, protocol tests, and all `match frame` sites in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo` wire format** — 6 tab-separated fields per line: `id\tname\tpty_path\tshell_pid\tcreated_at\tattached`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.

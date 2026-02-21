@@ -160,7 +160,7 @@ async fn new_session(
                     None => eprintln!("session created: id {id}"),
                 }
                 // Auto-attach: the daemon already handed off our connection to the session
-                let code = ttyleport::client::run(&ctl_path, &id, framed).await?;
+                let code = ttyleport::client::run(&id, framed).await?;
                 std::process::exit(code);
             }
             Some(Ok(Frame::Error { message })) => {
@@ -191,7 +191,7 @@ async fn attach(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
 
     match framed.next().await {
         Some(Ok(Frame::Ok)) => {
-            let code = ttyleport::client::run(&ctl_path, &target, framed).await?;
+            let code = ttyleport::client::run(&target, framed).await?;
             Ok(code)
         }
         Some(Ok(Frame::Error { message })) => {

@@ -4,7 +4,6 @@ use futures_util::{SinkExt, StreamExt};
 use nix::sys::termios::{self, SetArg, Termios};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::path::Path;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
@@ -90,31 +89,6 @@ fn get_terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
     (ws.ws_col, ws.ws_row)
-}
-
-/// Connect to daemon and send Attach, returning the framed connection on success.
-async fn reconnect(
-    daemon_socket: &Path,
-    session: &str,
-) -> io::Result<Framed<UnixStream, FrameCodec>> {
-    let stream = UnixStream::connect(daemon_socket).await?;
-    let mut framed = Framed::new(stream, FrameCodec);
-    framed
-        .send(Frame::Attach {
-            session: session.to_string(),
-        })
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
-    match framed.next().await {
-        Some(Ok(Frame::Ok)) => Ok(framed),
-        Some(Ok(Frame::Error { message })) => {
-            Err(io::Error::new(io::ErrorKind::NotFound, message))
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::ConnectionReset,
-            "unexpected response from daemon",
-        )),
-    }
 }
 
 /// Send a frame with a timeout. Returns false if the send failed or timed out.
@@ -205,7 +179,6 @@ async fn relay(
 }
 
 pub async fn run(
-    daemon_socket: &Path,
     session: &str,
     mut framed: Framed<UnixStream, FrameCodec>,
 ) -> anyhow::Result<i32> {
@@ -224,39 +197,13 @@ pub async fn run(
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
 
-    loop {
-        match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf).await? {
-            Some(code) => return Ok(code),
-            None => {
-                info!("reconnecting...");
-                // In raw mode, Ctrl-C arrives as byte 0x03 on stdin.
-                // Select on both so the user can kill the client during reconnect.
-                framed = loop {
-                    tokio::select! {
-                        result = reconnect(daemon_socket, session) => {
-                            match result {
-                                Ok(f) => break f,
-                                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                                    write_stdout(b"[session ended]\r\n")?;
-                                    return Ok(1);
-                                }
-                                Err(e) => {
-                                    debug!("reconnect failed: {e}, retrying...");
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
-                                }
-                            }
-                        }
-                        ready = async_stdin.readable() => {
-                            let mut guard = ready?;
-                            if let Ok(Ok(n)) = guard.try_io(|inner| inner.get_ref().read(&mut buf))
-                                && buf[..n].contains(&0x03)
-                            {
-                                return Ok(130);
-                            }
-                        }
-                    }
-                };
-            }
+    let code = match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf).await? {
+        Some(code) => code,
+        None => {
+            let msg = format!("[disconnected]\r\nreconnect: ttyleport attach -t {session}\r\n");
+            write_stdout(msg.as_bytes())?;
+            1
         }
-    }
+    };
+    Ok(code)
 }
