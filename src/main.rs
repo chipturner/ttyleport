@@ -111,9 +111,15 @@ async fn attach(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
     use tokio_util::codec::Framed;
     use ttyleport::protocol::{Frame, FrameCodec};
 
-    let stream = UnixStream::connect(&ctl_path)
-        .await
-        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display()))?;
+    let stream = loop {
+        match UnixStream::connect(&ctl_path).await {
+            Ok(s) => break s,
+            Err(_) => {
+                eprintln!("waiting for daemon ({})... ctrl-c to abort", ctl_path.display());
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    };
     let mut framed = Framed::new(stream, FrameCodec);
     framed
         .send(Frame::Attach {
