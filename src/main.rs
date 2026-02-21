@@ -31,6 +31,10 @@ enum Command {
         /// Session id or name
         #[arg(short = 't', long = "target")]
         target: String,
+
+        /// Don't send Ctrl-L to redraw after attaching
+        #[arg(long)]
+        no_redraw: bool,
     },
     /// List active sessions
     #[command(alias = "ls", alias = "list")]
@@ -59,8 +63,8 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon => ttyleport::daemon::run(&ctl_path).await,
         Command::NewSession { target } => new_session(target, ctl_path).await,
-        Command::Attach { target } => {
-            let code = attach(target, ctl_path).await?;
+        Command::Attach { target, no_redraw } => {
+            let code = attach(target, !no_redraw, ctl_path).await?;
             std::process::exit(code);
         }
         Command::ListSessions => list_sessions(ctl_path).await,
@@ -93,7 +97,7 @@ async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<
                 Some(n) => eprintln!("session created: {n} (id {id})"),
                 None => eprintln!("session created: id {id}"),
             }
-            let code = ttyleport::client::run(&id, framed).await?;
+            let code = ttyleport::client::run(&id, framed, false).await?;
             std::process::exit(code);
         }
         Some(Ok(Frame::Error { message })) => {
@@ -105,7 +109,7 @@ async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<
     }
 }
 
-async fn attach(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
+async fn attach(target: String, redraw: bool, ctl_path: PathBuf) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
@@ -129,7 +133,8 @@ async fn attach(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
 
     match framed.next().await {
         Some(Ok(Frame::Ok)) => {
-            let code = ttyleport::client::run(&target, framed).await?;
+            eprintln!("[attached]");
+            let code = ttyleport::client::run(&target, framed, redraw).await?;
             Ok(code)
         }
         Some(Ok(Frame::Error { message })) => {

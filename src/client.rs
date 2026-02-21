@@ -113,10 +113,15 @@ async fn relay(
     async_stdin: &AsyncFd<io::Stdin>,
     sigwinch: &mut tokio::signal::unix::Signal,
     buf: &mut [u8],
+    redraw: bool,
 ) -> anyhow::Result<Option<i32>> {
     // Send initial window size
     let (cols, rows) = get_terminal_size();
     if !timed_send(framed, Frame::Resize { cols, rows }).await {
+        return Ok(None);
+    }
+    // Inject Ctrl-L to force the shell/app to redraw
+    if redraw && !timed_send(framed, Frame::Data(Bytes::from_static(b"\x0c"))).await {
         return Ok(None);
     }
 
@@ -181,6 +186,7 @@ async fn relay(
 pub async fn run(
     session: &str,
     mut framed: Framed<UnixStream, FrameCodec>,
+    redraw: bool,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -197,7 +203,7 @@ pub async fn run(
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
 
-    let code = match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf).await? {
+    let code = match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, redraw).await? {
         Some(code) => code,
         None => {
             let msg = format!("[disconnected]\r\nreconnect: ttyleport attach -t {session}\r\n");

@@ -172,7 +172,9 @@ pub async fn run(
                                     &ws as *const _,
                                 );
                             }
-                            let _ = nix::sys::signal::killpg(managed.pgid, nix::sys::signal::Signal::SIGWINCH);
+                            if let Ok(pgid) = nix::unistd::tcgetpgrp(&async_master) {
+                                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGWINCH);
+                            }
                         }
                         // Client disconnected or sent Exit
                         Some(Ok(Frame::Exit { .. })) | None => {
