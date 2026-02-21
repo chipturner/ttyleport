@@ -174,13 +174,7 @@ async fn daemon_request(
 async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
     use ttyleport::protocol::Frame;
 
-    let resp = match daemon_request(&ctl_path, Frame::ListSessions).await {
-        Ok(resp) => resp,
-        Err(_) => {
-            println!("no active sessions");
-            return Ok(());
-        }
-    };
+    let resp = daemon_request(&ctl_path, Frame::ListSessions).await?;
     match resp {
         Frame::SessionInfo { sessions } => {
             if sessions.is_empty() {
