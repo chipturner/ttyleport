@@ -6,6 +6,8 @@ const TYPE_DATA: u8 = 0x01;
 const TYPE_RESIZE: u8 = 0x02;
 const TYPE_EXIT: u8 = 0x03;
 const TYPE_DETACHED: u8 = 0x04;
+const TYPE_PING: u8 = 0x05;
+const TYPE_PONG: u8 = 0x06;
 const TYPE_NEW_SESSION: u8 = 0x10;
 const TYPE_ATTACH: u8 = 0x11;
 const TYPE_LIST_SESSIONS: u8 = 0x12;
@@ -28,6 +30,7 @@ pub struct SessionEntry {
     pub shell_pid: u32,
     pub created_at: u64,
     pub attached: bool,
+    pub last_heartbeat: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,10 @@ pub enum Frame {
     },
     /// Sent to a client when another client takes over the session.
     Detached,
+    /// Heartbeat request (client → server).
+    Ping,
+    /// Heartbeat reply (server → client).
+    Pong,
     // Control requests
     NewSession {
         name: String,
@@ -120,6 +127,8 @@ impl Decoder for FrameCodec {
                 Ok(Some(Frame::Exit { code }))
             }
             TYPE_DETACHED => Ok(Some(Frame::Detached)),
+            TYPE_PING => Ok(Some(Frame::Ping)),
+            TYPE_PONG => Ok(Some(Frame::Pong)),
             TYPE_NEW_SESSION => {
                 let name = String::from_utf8(payload.to_vec())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -151,7 +160,7 @@ impl Decoder for FrameCodec {
                     text.lines()
                         .filter_map(|line| {
                             let parts: Vec<&str> = line.split('\t').collect();
-                            if parts.len() == 6 {
+                            if parts.len() == 7 {
                                 Some(SessionEntry {
                                     id: parts[0].to_string(),
                                     name: parts[1].to_string(),
@@ -159,6 +168,7 @@ impl Decoder for FrameCodec {
                                     shell_pid: parts[3].parse().unwrap_or(0),
                                     created_at: parts[4].parse().unwrap_or(0),
                                     attached: parts[5] == "1",
+                                    last_heartbeat: parts[6].parse().unwrap_or(0),
                                 })
                             } else {
                                 None
@@ -207,6 +217,14 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u8(TYPE_DETACHED);
                 dst.put_u32(0);
             }
+            Frame::Ping => {
+                dst.put_u8(TYPE_PING);
+                dst.put_u32(0);
+            }
+            Frame::Pong => {
+                dst.put_u8(TYPE_PONG);
+                dst.put_u32(0);
+            }
             Frame::NewSession { name } => {
                 dst.put_u8(TYPE_NEW_SESSION);
                 dst.put_u32(name.len() as u32);
@@ -240,13 +258,14 @@ impl Encoder<Frame> for FrameCodec {
                     .iter()
                     .map(|e| {
                         format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                             e.id,
                             e.name,
                             e.pty_path,
                             e.shell_pid,
                             e.created_at,
-                            if e.attached { "1" } else { "0" }
+                            if e.attached { "1" } else { "0" },
+                            e.last_heartbeat
                         )
                     })
                     .collect::<Vec<_>>()

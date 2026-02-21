@@ -104,7 +104,7 @@ async fn new_session(name: Option<String>, ctl_path: PathBuf) -> anyhow::Result<
                 Some(n) => eprintln!("session created: {n} (id {id})"),
                 None => eprintln!("session created: id {id}"),
             }
-            let code = ttyleport::client::run(&id, framed, false).await?;
+            let code = ttyleport::client::run(&id, framed, false, &ctl_path).await?;
             std::process::exit(code);
         }
         Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
@@ -139,7 +139,7 @@ async fn attach(target: String, redraw: bool, ctl_path: PathBuf) -> anyhow::Resu
     match framed.next().await {
         Some(Ok(Frame::Ok)) => {
             eprintln!("[attached]");
-            let code = ttyleport::client::run(&target, framed, redraw).await?;
+            let code = ttyleport::client::run(&target, framed, redraw, &ctl_path).await?;
             Ok(code)
         }
         Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
@@ -186,8 +186,21 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
             if sessions.is_empty() {
                 println!("no active sessions");
             } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 for s in &sessions {
-                    let status = if s.attached { "attached" } else { "detached" };
+                    let status = if s.attached {
+                        if s.last_heartbeat > 0 {
+                            let ago = now.saturating_sub(s.last_heartbeat);
+                            format!("attached, heartbeat {ago}s ago")
+                        } else {
+                            "attached".to_string()
+                        }
+                    } else {
+                        "detached".to_string()
+                    };
                     let label = if s.name.is_empty() {
                         s.id.clone()
                     } else {

@@ -5,7 +5,7 @@ use nix::pty::openpty;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
@@ -19,6 +19,7 @@ pub struct SessionMetadata {
     pub shell_pid: u32,
     pub created_at: u64,
     pub attached: AtomicBool,
+    pub last_heartbeat: AtomicU64,
 }
 
 /// Wraps a child process and its process group ID.
@@ -100,6 +101,7 @@ pub async fn run(
         shell_pid,
         created_at,
         attached: AtomicBool::new(false),
+        last_heartbeat: AtomicU64::new(0),
     });
 
     // Set master to non-blocking for AsyncFd
@@ -175,6 +177,16 @@ pub async fn run(
                             if let Ok(pgid) = nix::unistd::tcgetpgrp(&async_master) {
                                 let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGWINCH);
                             }
+                        }
+                        Some(Ok(Frame::Ping)) => {
+                            if let Some(meta) = metadata_slot.get() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                meta.last_heartbeat.store(now, Ordering::Relaxed);
+                            }
+                            let _ = framed.send(Frame::Pong).await;
                         }
                         // Client disconnected or sent Exit
                         Some(Ok(Frame::Exit { .. })) | None => {

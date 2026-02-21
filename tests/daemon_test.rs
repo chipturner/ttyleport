@@ -841,3 +841,47 @@ async fn kill_dead_session_returns_error() {
 
     let _ = std::fs::remove_file(&ctl_path);
 }
+
+#[tokio::test]
+async fn list_sessions_shows_heartbeat() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("heartbeat");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "hbtest").await;
+
+    // Attach and send a Ping
+    let mut framed = attach_session(&ctl_path, &id).await;
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+
+    framed.send(Frame::Ping).await.unwrap();
+    // Wait for Pong
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::Pong))) => break,
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    // List sessions — last_heartbeat should be > 0
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    match &resp {
+        Frame::SessionInfo { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert!(
+                sessions[0].last_heartbeat > 0,
+                "last_heartbeat should be set after Ping, got {}",
+                sessions[0].last_heartbeat
+            );
+        }
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
+
+    kill_cleanup(&ctl_path, &id).await;
+    let _ = std::fs::remove_file(&ctl_path);
+}

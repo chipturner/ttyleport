@@ -69,6 +69,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     shell_pid: meta.shell_pid,
                     created_at: meta.created_at,
                     attached: meta.attached.load(Ordering::Relaxed),
+                    last_heartbeat: meta.last_heartbeat.load(Ordering::Relaxed),
                 }
             } else {
                 SessionEntry {
@@ -78,6 +79,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     shell_pid: 0,
                     created_at: 0,
                     attached: false,
+                    last_heartbeat: 0,
                 }
             }
         })

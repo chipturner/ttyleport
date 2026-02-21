@@ -4,10 +4,12 @@ use futures_util::{SinkExt, StreamExt};
 use nix::sys::termios::{self, SetArg, Termios};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::path::Path;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::Instant;
 use tokio_util::codec::Framed;
 use tracing::{debug, info};
 
@@ -106,8 +108,11 @@ async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -
     }
 }
 
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Relay between stdin/stdout and the framed socket.
-/// Returns `Some(code)` on clean shell exit, `None` on server disconnect.
+/// Returns `Some(code)` on clean shell exit or detach, `None` on server disconnect / heartbeat timeout.
 async fn relay(
     framed: &mut Framed<UnixStream, FrameCodec>,
     async_stdin: &AsyncFd<io::Stdin>,
@@ -124,6 +129,10 @@ async fn relay(
     if redraw && !timed_send(framed, Frame::Data(Bytes::from_static(b"\x0c"))).await {
         return Ok(None);
     }
+
+    let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
+    let mut last_pong = Instant::now();
 
     loop {
         tokio::select! {
@@ -150,6 +159,10 @@ async fn relay(
                     Some(Ok(Frame::Data(data))) => {
                         debug!(len = data.len(), "socket → stdout");
                         write_stdout(&data)?;
+                    }
+                    Some(Ok(Frame::Pong)) => {
+                        debug!("pong received");
+                        last_pong = Instant::now();
                     }
                     Some(Ok(Frame::Exit { code })) => {
                         info!(code, "server sent exit");
@@ -179,6 +192,16 @@ async fn relay(
                     return Ok(None);
                 }
             }
+
+            _ = heartbeat_interval.tick() => {
+                if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
+                    debug!("heartbeat timeout");
+                    return Ok(None);
+                }
+                if !timed_send(framed, Frame::Ping).await {
+                    return Ok(None);
+                }
+            }
         }
     }
 }
@@ -187,6 +210,7 @@ pub async fn run(
     session: &str,
     mut framed: Framed<UnixStream, FrameCodec>,
     redraw: bool,
+    ctl_path: &Path,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -202,14 +226,62 @@ pub async fn run(
     let async_stdin = AsyncFd::new(io::stdin())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
+    let mut current_redraw = redraw;
 
-    let code = match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, redraw).await? {
-        Some(code) => code,
-        None => {
-            let msg = format!("[disconnected]\r\nreconnect: ttyleport attach -t {session}\r\n");
-            write_stdout(msg.as_bytes())?;
-            1
+    loop {
+        match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, current_redraw).await? {
+            Some(code) => return Ok(code),
+            None => {
+                // Disconnected — try to reconnect
+                write_stdout(b"[reconnecting...]\r\n")?;
+
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+
+                    // Check for Ctrl-C (0x03) in raw mode
+                    {
+                        let mut peek = [0u8; 1];
+                        match io::stdin().read(&mut peek) {
+                            Ok(1) if peek[0] == 0x03 => {
+                                write_stdout(b"\r\n")?;
+                                return Ok(1);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let stream = match UnixStream::connect(ctl_path).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    let mut new_framed = Framed::new(stream, FrameCodec);
+                    if new_framed
+                        .send(Frame::Attach {
+                            session: session.to_string(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    match new_framed.next().await {
+                        Some(Ok(Frame::Ok)) => {
+                            write_stdout(b"[reconnected]\r\n")?;
+                            framed = new_framed;
+                            current_redraw = true;
+                            break;
+                        }
+                        Some(Ok(Frame::Error { message })) => {
+                            let msg = format!("[session gone: {message}]\r\n");
+                            write_stdout(msg.as_bytes())?;
+                            return Ok(1);
+                        }
+                        _ => continue,
+                    }
+                }
+            }
         }
-    };
-    Ok(code)
+    }
 }

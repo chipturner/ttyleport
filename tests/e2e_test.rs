@@ -578,3 +578,37 @@ async fn high_throughput_data_relay() {
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }
+
+#[tokio::test]
+async fn ping_pong_heartbeat() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Send Ping, expect Pong back
+    framed.send(Frame::Ping).await.unwrap();
+    let mut got_pong = false;
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::Pong))) => {
+                got_pong = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            _ => break,
+        }
+    }
+    assert!(got_pong, "server should reply with Pong to Ping");
+
+    // Verify last_heartbeat was updated in metadata
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let m = meta.get().expect("metadata should be set");
+    let hb = m
+        .last_heartbeat
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(hb > 0, "last_heartbeat should be updated after Ping");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}

@@ -173,6 +173,7 @@ fn roundtrip_session_info() {
                 shell_pid: 1234,
                 created_at: 1700000000,
                 attached: true,
+                last_heartbeat: 1700000005,
             },
             SessionEntry {
                 id: "1".to_string(),
@@ -181,6 +182,7 @@ fn roundtrip_session_info() {
                 shell_pid: 5678,
                 created_at: 1700000100,
                 attached: false,
+                last_heartbeat: 0,
             },
         ],
     };
@@ -355,11 +357,12 @@ fn session_info_with_tabs_in_id() {
             shell_pid: 1234,
             created_at: 1700000000,
             attached: true,
+            last_heartbeat: 0,
         }],
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    // The tab splits the field incorrectly — 7 fields instead of 6, so filter_map drops the line
+    // The tab splits the field incorrectly — 8 fields instead of 7, so filter_map drops the line
     match decoded {
         Frame::SessionInfo { sessions } => {
             assert_eq!(
@@ -416,9 +419,8 @@ fn decode_consumes_only_one_frame() {
 #[test]
 fn session_info_with_newline_in_name() {
     // Newlines in names corrupt the line-separated wire format.
-    // Wire: "0\thas\nnewline\t/dev/pts/3\t1234\t1700000000\t1"
-    // Splits into: "0\thas" (2 fields, dropped) and "newline\t/dev/pts/3\t1234\t1700000000\t1" (5 fields, dropped)
-    // Neither fragment has 6 fields, so both are dropped.
+    // Wire: "0\thas\nnewline\t/dev/pts/3\t1234\t1700000000\t1\t0"
+    // Splits into two lines, neither has 7 fields, so both are dropped.
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
@@ -429,6 +431,7 @@ fn session_info_with_newline_in_name() {
             shell_pid: 1234,
             created_at: 1700000000,
             attached: true,
+            last_heartbeat: 0,
         }],
     };
     codec.encode(original, &mut buf).unwrap();
@@ -455,4 +458,26 @@ fn invalid_utf8_in_string_frame() {
     buf.put_slice(&[0xFF, 0xFE]); // invalid UTF-8
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn roundtrip_ping() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::Ping, &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf[0], 0x05);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::Ping, decoded);
+}
+
+#[test]
+fn roundtrip_pong() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::Pong, &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf[0], 0x06);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::Pong, decoded);
 }
