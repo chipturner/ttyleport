@@ -74,7 +74,16 @@ fn write_stdout(data: &[u8]) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-    stdout.flush()
+    loop {
+        match stdout.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn get_terminal_size() -> (u16, u16) {
