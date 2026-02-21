@@ -1,46 +1,47 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use tokio::net::UnixStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 use ttyleport::protocol::{Frame, FrameCodec};
 
-static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
-
 /// Limit concurrent e2e tests to avoid PTY/CPU exhaustion under parallel load.
 static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
-/// Generate a unique socket path per test to avoid parallel conflicts.
-fn unique_sock(label: &str) -> std::path::PathBuf {
-    let pid = std::process::id();
-    let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ttyleport-e2e-{label}-{pid}-{seq}.sock"))
+/// Spawn a server task connected via socketpair + channel.
+/// Returns (client_tx for takeover, client-side framed, server join handle).
+async fn setup_session() -> (
+    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    Framed<UnixStream, FrameCodec>,
+    JoinHandle<anyhow::Result<()>>,
+    Arc<OnceLock<ttyleport::server::SessionMetadata>>,
+) {
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let meta = Arc::new(OnceLock::new());
+    let meta_clone = Arc::clone(&meta);
+    let handle = tokio::spawn(async move { ttyleport::server::run(client_rx, meta_clone).await });
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+
+    let framed = Framed::new(client_stream, FrameCodec);
+    (client_tx, framed, handle, meta)
 }
 
-async fn connect_to_server(socket_path: &std::path::Path) -> Framed<UnixStream, FrameCodec> {
-    // Wait for server to bind — retry to handle parallel test load
-    let stream = loop {
-        match UnixStream::connect(socket_path).await {
-            Ok(s) => break s,
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    };
-    let mut framed = Framed::new(stream, FrameCodec);
-
+/// Wait for shell to produce initial output (confirms it's alive).
+async fn wait_for_shell(framed: &mut Framed<UnixStream, FrameCodec>) {
     // Send initial resize
     framed
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
         .unwrap();
 
-    // Wait for shell to actually produce output (confirms it's alive).
-    // Under parallel test load, shell startup can take several seconds.
-    // We peek by waiting for a Data frame, then push it back by reading
-    // all available data in the caller's drain step.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match timeout(Duration::from_secs(1), framed.next()).await {
@@ -51,8 +52,6 @@ async fn connect_to_server(socket_path: &std::path::Path) -> Framed<UnixStream, 
             _ => continue,
         }
     }
-
-    framed
 }
 
 /// Drain all available Data frames within a timeout, return concatenated bytes.
@@ -61,11 +60,8 @@ async fn read_available_data(
     wait: Duration,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        match timeout(wait, framed.next()).await {
-            Ok(Some(Ok(Frame::Data(data)))) => out.extend_from_slice(&data),
-            _ => break,
-        }
+    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(wait, framed.next()).await {
+        out.extend_from_slice(&data);
     }
     out
 }
@@ -87,45 +83,26 @@ async fn expect_exit_frame(
 #[tokio::test]
 async fn server_spawns_shell_and_relays_output() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let socket_path = unique_sock("output");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
-    // connect_to_server already verified shell output arrived
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_millis(500)).await;
 
-    // Send exit to cleanly close
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn server_relays_command_output() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let socket_path = unique_sock("echo");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
-
-    // Drain initial prompt
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Send a command whose output we can identify
     framed
         .send(Frame::Data(Bytes::from("echo TTYLEPORT_TEST_OK\n")))
         .await
         .unwrap();
 
-    // Read output — should contain our marker string
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
@@ -135,25 +112,15 @@ async fn server_relays_command_output() {
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn server_sends_exit_frame_on_shell_exit() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let socket_path = unique_sock("exit");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let _server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
-
-    // Drain initial prompt
+    let (_tx, mut framed, _server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Tell shell to exit with specific code
     framed
         .send(Frame::Data(Bytes::from("exit 42\n")))
         .await
@@ -161,21 +128,13 @@ async fn server_sends_exit_frame_on_shell_exit() {
 
     let code = expect_exit_frame(&mut framed, Duration::from_secs(5)).await;
     assert_eq!(code, Some(42), "expected exit code 42");
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn reconnect_preserves_shell_session() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let socket_path = unique_sock("reconnect");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    // First connection: set a variable in the shell
-    let mut framed = connect_to_server(&socket_path).await;
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
     framed
@@ -187,12 +146,15 @@ async fn reconnect_preserves_shell_session() {
     // Disconnect by dropping the framed stream
     drop(framed);
 
-    // Give server time to notice disconnect and re-accept
+    // Give server time to notice disconnect
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Second connection: verify the variable is still set
-    let stream = UnixStream::connect(&socket_path).await.unwrap();
-    let mut framed = Framed::new(stream, FrameCodec);
+    // Second connection via socketpair through channel
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
     framed
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
@@ -213,27 +175,17 @@ async fn reconnect_preserves_shell_session() {
         "shell session should persist across reconnect, got: {output_str}"
     );
 
-    // Clean up
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn server_exits_when_shell_dies_while_disconnected() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let socket_path = unique_sock("shell-dies");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    // Connect and tell shell to exit after a delay, then disconnect
-    let mut framed = connect_to_server(&socket_path).await;
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Schedule shell to exit after we disconnect
     framed
         .send(Frame::Data(Bytes::from("sleep 0.5 && exit 0\n")))
         .await
@@ -243,32 +195,27 @@ async fn server_exits_when_shell_dies_while_disconnected() {
     // Disconnect
     drop(framed);
 
-    // Server should exit once the shell dies (within a few seconds)
+    // Server should exit once the shell dies
     let result = timeout(Duration::from_secs(5), server).await;
     assert!(
         result.is_ok(),
         "server should exit after shell dies while disconnected"
     );
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn second_client_detaches_first() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let socket_path = unique_sock("takeover");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    // First client connects
-    let mut client1 = connect_to_server(&socket_path).await;
+    let (client_tx, mut client1, server, _meta) = setup_session().await;
+    wait_for_shell(&mut client1).await;
     read_available_data(&mut client1, Duration::from_secs(1)).await;
 
-    // Second client connects — should take over the session
-    let stream2 = UnixStream::connect(&socket_path).await.unwrap();
-    let mut client2 = Framed::new(stream2, FrameCodec);
+    // Second client connects via channel — should take over the session
+    let (server_stream2, client_stream2) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream2, FrameCodec))
+        .unwrap();
+    let mut client2 = Framed::new(client_stream2, FrameCodec);
     client2
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
@@ -303,27 +250,15 @@ async fn second_client_detaches_first() {
         "second client should be able to use the session, got: {output_str}"
     );
 
-    // Clean up
     let _ = client2.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
-
-// ─── New hardening tests ────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn exit_code_zero_sends_exit_frame() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Regression test: PTY EOF/EIO race previously caused server to close
-    // without sending Exit frame when exit code was 0.
-    let socket_path = unique_sock("exit0");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let _server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
+    let (_tx, mut framed, _server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
     framed
@@ -333,54 +268,35 @@ async fn exit_code_zero_sends_exit_frame() {
 
     let code = expect_exit_frame(&mut framed, Duration::from_secs(5)).await;
     assert_eq!(code, Some(0), "expected exit code 0");
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn exit_code_signal_death() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Shell killed by SIGKILL — exit code should be non-zero
-    let socket_path = unique_sock("sigkill");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let meta = Arc::new(OnceLock::new());
-    let meta_clone = Arc::clone(&meta);
-    let path = socket_path.clone();
-    let _server = tokio::spawn(async move { ttyleport::server::run(&path, meta_clone).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
+    let (_tx, mut framed, _server, meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Wait for metadata to be available so we can get the shell PID
+    // Wait for metadata
     tokio::time::sleep(Duration::from_millis(100)).await;
     let shell_pid = meta.get().map(|m| m.shell_pid).unwrap_or(0);
     assert!(shell_pid > 0, "should have shell PID in metadata");
 
-    // Kill the shell with SIGKILL from outside
     unsafe {
         libc::kill(shell_pid as i32, libc::SIGKILL);
     }
 
-    // Should get an Exit frame (code will be non-zero since killed by signal)
     let code = expect_exit_frame(&mut framed, Duration::from_secs(5)).await;
     assert!(code.is_some(), "expected Exit frame after SIGKILL");
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn rapid_reconnect_cycles() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Rapidly disconnect and reconnect 3 times, shell should survive all.
-    let socket_path = unique_sock("rapid-reconnect");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    // First connection: set a marker
-    let mut framed = connect_to_server(&socket_path).await;
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
+
     framed
         .send(Frame::Data(Bytes::from(
             "export RAPID_TEST_MARKER=survived\n",
@@ -390,14 +306,15 @@ async fn rapid_reconnect_cycles() {
     read_available_data(&mut framed, Duration::from_millis(500)).await;
 
     // Rapidly disconnect and reconnect 3 times
-    for i in 0..3 {
+    for _i in 0..3 {
         drop(framed);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let stream = UnixStream::connect(&socket_path).await.unwrap_or_else(|e| {
-            panic!("reconnect {i} failed: {e}");
-        });
-        framed = Framed::new(stream, FrameCodec);
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        client_tx
+            .send(Framed::new(server_stream, FrameCodec))
+            .unwrap();
+        framed = Framed::new(client_stream, FrameCodec);
         framed
             .send(Frame::Resize { cols: 80, rows: 24 })
             .await
@@ -405,7 +322,6 @@ async fn rapid_reconnect_cycles() {
         read_available_data(&mut framed, Duration::from_millis(500)).await;
     }
 
-    // Verify marker still set after all cycles
     framed
         .send(Frame::Data(Bytes::from("echo $RAPID_TEST_MARKER\n")))
         .await
@@ -419,38 +335,27 @@ async fn rapid_reconnect_cycles() {
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
-async fn control_frame_on_session_socket_is_ignored() {
+async fn control_frame_on_session_is_ignored() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Sending control frames (ListSessions, KillServer, etc.) to a session
-    // socket should be silently ignored, not crash the server.
-    let socket_path = unique_sock("ctrl-on-session");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Send various control frames that make no sense on a session socket
+    // Send various control frames that make no sense on a session connection
     framed.send(Frame::ListSessions).await.unwrap();
     framed.send(Frame::KillServer).await.unwrap();
     framed
-        .send(Frame::CreateSession {
-            path: "/tmp/bogus.sock".to_string(),
+        .send(Frame::NewSession {
+            name: "bogus".to_string(),
         })
         .await
         .unwrap();
 
-    // Give server a moment to process
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Server should still be alive — verify by running a command
     framed
         .send(Frame::Data(Bytes::from("echo STILL_ALIVE\n")))
         .await
@@ -460,32 +365,20 @@ async fn control_frame_on_session_socket_is_ignored() {
     let output_str = String::from_utf8_lossy(&output);
     assert!(
         output_str.contains("STILL_ALIVE"),
-        "server should survive control frames on session socket, got: {output_str}"
+        "server should survive control frames on session, got: {output_str}"
     );
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn pty_buffer_saturation_and_resume() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // When no client is connected, shell output fills the kernel PTY buffer (~4KB).
-    // The shell blocks until a client reconnects and drains it.
-    let socket_path = unique_sock("pty-saturation");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Tell shell to produce output after we disconnect, then set a marker.
-    // The `seq` output will fill the PTY buffer, blocking the shell.
-    // When we reconnect and drain, the shell unblocks and runs the echo.
     framed
         .send(Frame::Data(Bytes::from(
             "{ sleep 0.3; seq 1 2000; echo PTY_DRAINED_OK; } &\n",
@@ -500,15 +393,17 @@ async fn pty_buffer_saturation_and_resume() {
     // Wait for output to start filling the PTY buffer
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Reconnect and drain
-    let stream = UnixStream::connect(&socket_path).await.unwrap();
-    let mut framed = Framed::new(stream, FrameCodec);
+    // Reconnect via socketpair
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
     framed
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
         .unwrap();
 
-    // Drain all buffered + new output
     let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
@@ -519,24 +414,15 @@ async fn pty_buffer_saturation_and_resume() {
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn resize_propagates_to_pty() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Verify that sending a Resize frame actually changes the PTY window size.
-    let socket_path = unique_sock("resize");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Set a specific window size
     framed
         .send(Frame::Resize {
             cols: 132,
@@ -546,7 +432,6 @@ async fn resize_propagates_to_pty() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Query the PTY size via stty
     framed
         .send(Frame::Data(Bytes::from("stty size\n")))
         .await
@@ -560,33 +445,21 @@ async fn resize_propagates_to_pty() {
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn metadata_reflects_attached_state() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Verify SessionMetadata.attached flag toggles on connect/disconnect.
-    let socket_path = unique_sock("meta-attached");
-    let _ = std::fs::remove_file(&socket_path);
+    let (client_tx, mut framed, server, meta) = setup_session().await;
 
-    let meta = Arc::new(OnceLock::new());
-    let meta_clone = Arc::clone(&meta);
-    let path = socket_path.clone();
-    let server = tokio::spawn(async move { ttyleport::server::run(&path, meta_clone).await });
-
-    // Before connect: not attached
+    // Wait for metadata to be set
     tokio::time::sleep(Duration::from_millis(300)).await;
     let m = meta
         .get()
         .expect("metadata should be set after server starts");
-    assert!(
-        !m.attached.load(std::sync::atomic::Ordering::Relaxed),
-        "should not be attached before client connects"
-    );
 
-    // Connect
-    let mut framed = connect_to_server(&socket_path).await;
+    // The first client was already sent via setup_session, so attached should be true after shell starts
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_millis(500)).await;
     assert!(
         m.attached.load(std::sync::atomic::Ordering::Relaxed),
@@ -602,29 +475,24 @@ async fn metadata_reflects_attached_state() {
     );
 
     // Reconnect and clean up
-    let stream = UnixStream::connect(&socket_path).await.unwrap();
-    let mut framed = Framed::new(stream, FrameCodec);
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
     framed
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
         .unwrap();
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn client_explicit_exit_frame() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Client sends Frame::Exit — server treats it like disconnect (ClientGone).
-    let socket_path = unique_sock("client-exit");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
     // Send Exit frame from client side
@@ -635,8 +503,11 @@ async fn client_explicit_exit_frame() {
 
     // Server should still be running (it treats Exit as client disconnect).
     // Reconnect to verify shell is alive.
-    let stream = UnixStream::connect(&socket_path).await.unwrap();
-    let mut framed = Framed::new(stream, FrameCodec);
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
     framed
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
@@ -656,25 +527,15 @@ async fn client_explicit_exit_frame() {
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }
 
 #[tokio::test]
 async fn high_throughput_data_relay() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Pump ~2MB through the session to stress-test the relay path.
-    // Catches WouldBlock errors on non-blocking stdout and buffer issues.
-    let socket_path = unique_sock("throughput");
-    let _ = std::fs::remove_file(&socket_path);
-
-    let path = socket_path.clone();
-    let server =
-        tokio::spawn(async move { ttyleport::server::run(&path, Arc::new(OnceLock::new())).await });
-
-    let mut framed = connect_to_server(&socket_path).await;
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Generate ~2MB of output, then print a marker we can check for.
     framed
         .send(Frame::Data(Bytes::from(
             "head -c 2000000 /dev/urandom | base64; echo THROUGHPUT_DONE\n",
@@ -682,7 +543,6 @@ async fn high_throughput_data_relay() {
         .await
         .unwrap();
 
-    // Drain all output with a generous timeout for the large payload
     let mut total = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -709,7 +569,6 @@ async fn high_throughput_data_relay() {
         &output_str[output_str.len().saturating_sub(100)..],
     );
 
-    // base64 of 2MB produces ~2.67MB; verify we got a substantial amount
     assert!(
         total.len() > 1_000_000,
         "expected >1MB of output, got {} bytes",
@@ -718,5 +577,4 @@ async fn high_throughput_data_relay() {
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
-    let _ = std::fs::remove_file(&socket_path);
 }

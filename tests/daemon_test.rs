@@ -14,27 +14,11 @@ static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Limit concurrent daemon tests to avoid PTY/CPU exhaustion under parallel load.
 static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(3));
 
-/// Generate unique socket paths per test to avoid parallel conflicts.
-fn unique_socks(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+/// Generate a unique control socket path per test.
+fn unique_ctl(label: &str) -> std::path::PathBuf {
     let pid = std::process::id();
     let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir();
-    (
-        dir.join(format!("ttyleport-d-{label}-{pid}-{seq}-ctl.sock")),
-        dir.join(format!("ttyleport-d-{label}-{pid}-{seq}-sess.sock")),
-    )
-}
-
-/// Generate unique socket paths for tests needing 2 session sockets.
-fn unique_socks3(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    let pid = std::process::id();
-    let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir();
-    (
-        dir.join(format!("ttyleport-d-{label}-{pid}-{seq}-ctl.sock")),
-        dir.join(format!("ttyleport-d-{label}-{pid}-{seq}-s1.sock")),
-        dir.join(format!("ttyleport-d-{label}-{pid}-{seq}-s2.sock")),
-    )
+    std::env::temp_dir().join(format!("ttyleport-d-{label}-{pid}-{seq}-ctl.sock"))
 }
 
 /// Helper: send a control frame and get the response.
@@ -51,38 +35,58 @@ async fn control_request(ctl_path: &std::path::Path, frame: Frame) -> Frame {
 
 /// Drain all available Data frames within a timeout.
 async fn drain_data(framed: &mut Framed<UnixStream, FrameCodec>, wait: Duration) {
-    loop {
-        match timeout(wait, framed.next()).await {
-            Ok(Some(Ok(Frame::Data(_)))) => {}
-            _ => break,
+    while let Ok(Some(Ok(Frame::Data(_)))) = timeout(wait, framed.next()).await {}
+}
+
+/// Create a session via NewSession, return the session id.
+async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
+    let resp = control_request(
+        ctl_path,
+        Frame::NewSession {
+            name: name.to_string(),
+        },
+    )
+    .await;
+    match resp {
+        Frame::SessionCreated { id } => {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            id
         }
+        other => panic!("expected SessionCreated, got {other:?}"),
     }
 }
 
-/// Connect to a session socket, send resize, and wait for shell to produce output.
-async fn connect_session(session_path: &std::path::Path) -> Framed<UnixStream, FrameCodec> {
-    let stream = loop {
-        match UnixStream::connect(session_path).await {
-            Ok(s) => break s,
-            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    };
+/// Attach to a session via daemon, return the framed connection.
+async fn attach_session(
+    ctl_path: &std::path::Path,
+    session: &str,
+) -> Framed<UnixStream, FrameCodec> {
+    let stream = UnixStream::connect(ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
+    framed
+        .send(Frame::Attach {
+            session: session.to_string(),
+        })
+        .await
+        .unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert_eq!(resp, Frame::Ok, "expected Ok for attach, got {resp:?}");
+
+    // Send resize and wait for shell output
     framed
         .send(Frame::Resize { cols: 80, rows: 24 })
         .await
         .unwrap();
-
-    // Wait for shell to actually be alive (first Data frame)
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         match timeout(Duration::from_secs(1), framed.next()).await {
             Ok(Some(Ok(Frame::Data(_)))) => break,
             _ if tokio::time::Instant::now() >= deadline => {
-                panic!(
-                    "shell did not produce output within 15s on {}",
-                    session_path.display()
-                )
+                panic!("shell did not produce output within 15s")
             }
             _ => continue,
         }
@@ -91,25 +95,12 @@ async fn connect_session(session_path: &std::path::Path) -> Framed<UnixStream, F
     framed
 }
 
-/// Helper: create a session via daemon, wait for it to bind.
-async fn create_session(ctl_path: &std::path::Path, session_path: &std::path::Path) {
-    let resp = control_request(
-        ctl_path,
-        Frame::CreateSession {
-            path: session_path.display().to_string(),
-        },
-    )
-    .await;
-    assert_eq!(resp, Frame::Ok);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-}
-
-/// Clean up a session via kill-session (no shell connection needed).
-async fn kill_cleanup(ctl_path: &std::path::Path, session_path: &std::path::Path) {
+/// Kill a session by id or name.
+async fn kill_cleanup(ctl_path: &std::path::Path, session: &str) {
     let _ = control_request(
         ctl_path,
         Frame::KillSession {
-            path: session_path.display().to_string(),
+            session: session.to_string(),
         },
     )
     .await;
@@ -119,84 +110,103 @@ async fn kill_cleanup(ctl_path: &std::path::Path, session_path: &std::path::Path
 #[tokio::test]
 async fn daemon_creates_and_lists_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (ctl_path, session_path) = unique_socks("create-list");
+    let ctl_path = unique_ctl("create-list");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    create_session(&ctl_path, &session_path).await;
+    let id = create_session(&ctl_path, "mytest").await;
 
     // List sessions — should see one
     let resp = control_request(&ctl_path, Frame::ListSessions).await;
     match &resp {
         Frame::SessionInfo { sessions } => {
             assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].path, session_path.display().to_string());
+            assert_eq!(sessions[0].id, id);
+            assert_eq!(sessions[0].name, "mytest");
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
 
-    // Clean up via kill (no need to connect to shell — this test is about create/list)
-    kill_cleanup(&ctl_path, &session_path).await;
+    kill_cleanup(&ctl_path, &id).await;
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 }
 
 #[tokio::test]
-async fn daemon_rejects_duplicate_session() {
+async fn daemon_rejects_duplicate_name() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (ctl_path, session_path) = unique_socks("dup");
+    let ctl_path = unique_ctl("dup");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    create_session(&ctl_path, &session_path).await;
+    let id = create_session(&ctl_path, "dupname").await;
 
-    // Try to create same session again
+    // Try to create session with same name again
     let resp = control_request(
         &ctl_path,
-        Frame::CreateSession {
-            path: session_path.display().to_string(),
+        Frame::NewSession {
+            name: "dupname".to_string(),
         },
     )
     .await;
     assert!(
         matches!(resp, Frame::Error { .. }),
-        "expected Error for duplicate session, got {resp:?}"
+        "expected Error for duplicate name, got {resp:?}"
     );
 
-    kill_cleanup(&ctl_path, &session_path).await;
+    kill_cleanup(&ctl_path, &id).await;
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
+}
+
+#[tokio::test]
+async fn daemon_allows_multiple_unnamed_sessions() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("unnamed");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Create two unnamed sessions (empty name)
+    let id1 = create_session(&ctl_path, "").await;
+    let id2 = create_session(&ctl_path, "").await;
+    assert_ne!(id1, id2);
+
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    match &resp {
+        Frame::SessionInfo { sessions } => {
+            assert_eq!(sessions.len(), 2, "expected 2 sessions");
+        }
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
+
+    kill_cleanup(&ctl_path, &id1).await;
+    kill_cleanup(&ctl_path, &id2).await;
+    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn daemon_kills_session() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (ctl_path, session_path) = unique_socks("kill");
+    let ctl_path = unique_ctl("kill");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    create_session(&ctl_path, &session_path).await;
+    let id = create_session(&ctl_path, "killme").await;
 
-    // Kill it
     let resp = control_request(
         &ctl_path,
         Frame::KillSession {
-            path: session_path.display().to_string(),
+            session: id.clone(),
         },
     )
     .await;
@@ -212,8 +222,39 @@ async fn daemon_kills_session() {
         other => panic!("expected SessionInfo, got {other:?}"),
     }
 
-    // Socket file should be gone
-    assert!(!session_path.exists(), "session socket should be removed");
+    let _ = std::fs::remove_file(&ctl_path);
+}
+
+#[tokio::test]
+async fn daemon_kills_session_by_name() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("kill-name");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _id = create_session(&ctl_path, "named-kill").await;
+
+    // Kill by name
+    let resp = control_request(
+        &ctl_path,
+        Frame::KillSession {
+            session: "named-kill".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(resp, Frame::Ok);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    match &resp {
+        Frame::SessionInfo { sessions } => {
+            assert!(sessions.is_empty(), "expected no sessions after kill by name");
+        }
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
 
     let _ = std::fs::remove_file(&ctl_path);
 }
@@ -221,83 +262,62 @@ async fn daemon_kills_session() {
 #[tokio::test]
 async fn daemon_kills_server() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (ctl_path, session_path) = unique_socks("killsrv");
+    let ctl_path = unique_ctl("killsrv");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    create_session(&ctl_path, &session_path).await;
+    let _id = create_session(&ctl_path, "doomed").await;
 
-    // Kill the server
     let resp = control_request(&ctl_path, Frame::KillServer).await;
     assert_eq!(resp, Frame::Ok);
 
-    // Daemon task should exit
     let result = timeout(Duration::from_secs(3), daemon).await;
     assert!(result.is_ok(), "daemon should exit after kill-server");
 
-    // Control socket should be gone
     assert!(!ctl_path.exists(), "control socket should be removed");
-
-    let _ = std::fs::remove_file(&session_path);
 }
 
-// ─── New hardening tests ────────────────────────────────────────────────────
-
 #[tokio::test]
-async fn create_after_kill_same_path() {
+async fn create_after_kill_same_name() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Kill a session, then create a new one at the same path.
-    let (ctl_path, session_path) = unique_socks("create-after-kill");
+    let ctl_path = unique_ctl("create-after-kill");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Create first session
-    create_session(&ctl_path, &session_path).await;
+    let id1 = create_session(&ctl_path, "reuse").await;
 
     // Kill it
     let resp = control_request(
         &ctl_path,
         Frame::KillSession {
-            path: session_path.display().to_string(),
+            session: id1.clone(),
         },
     )
     .await;
     assert_eq!(resp, Frame::Ok);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Create again at the same path — should succeed
-    let resp = control_request(
-        &ctl_path,
-        Frame::CreateSession {
-            path: session_path.display().to_string(),
-        },
-    )
-    .await;
-    assert_eq!(
-        resp,
-        Frame::Ok,
-        "should be able to create session at same path after kill"
-    );
+    // Create again with same name
+    let id2 = create_session(&ctl_path, "reuse").await;
+    assert_ne!(id1, id2, "should get a new id");
 
-    // Verify recreated session appears in list with valid metadata
-    // Poll until metadata is populated (shell_pid > 0)
+    // Verify session appears with valid metadata
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
-                assert_eq!(sessions[0].path, session_path.display().to_string());
+            Frame::SessionInfo { sessions }
+                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
+            {
+                assert_eq!(sessions[0].id, id2);
+                assert_eq!(sessions[0].name, "reuse");
                 break;
             }
             _ if tokio::time::Instant::now() < deadline => continue,
@@ -305,42 +325,30 @@ async fn create_after_kill_same_path() {
         }
     }
 
-    kill_cleanup(&ctl_path, &session_path).await;
+    kill_cleanup(&ctl_path, &id2).await;
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 }
 
 #[tokio::test]
 async fn multiple_concurrent_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (ctl_path, session1, session2) = unique_socks3("multi");
+    let ctl_path = unique_ctl("multi");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session1);
-    let _ = std::fs::remove_file(&session2);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Create two sessions
-    create_session(&ctl_path, &session1).await;
-    create_session(&ctl_path, &session2).await;
+    let id1 = create_session(&ctl_path, "sess-a").await;
+    let id2 = create_session(&ctl_path, "sess-b").await;
 
-    // List should show both
     let resp = control_request(&ctl_path, Frame::ListSessions).await;
     match &resp {
         Frame::SessionInfo { sessions } => {
             assert_eq!(sessions.len(), 2, "expected 2 sessions");
-            let paths: Vec<&str> = sessions.iter().map(|s| s.path.as_str()).collect();
-            assert!(
-                paths.contains(&session1.display().to_string().as_str()),
-                "should contain session1"
-            );
-            assert!(
-                paths.contains(&session2.display().to_string().as_str()),
-                "should contain session2"
-            );
+            let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+            assert!(ids.contains(&id1.as_str()), "should contain session 1");
+            assert!(ids.contains(&id2.as_str()), "should contain session 2");
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -361,23 +369,19 @@ async fn multiple_concurrent_sessions() {
         }
     }
 
-    kill_cleanup(&ctl_path, &session1).await;
-    kill_cleanup(&ctl_path, &session2).await;
+    kill_cleanup(&ctl_path, &id1).await;
+    kill_cleanup(&ctl_path, &id2).await;
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session1);
-    let _ = std::fs::remove_file(&session2);
 }
 
 #[tokio::test]
 async fn daemon_unexpected_frame() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Sending a Data frame to the control socket should return Error.
-    let (ctl_path, _) = unique_socks("unexpected");
+    let ctl_path = unique_ctl("unexpected");
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Send a Data frame (makes no sense on control socket)
@@ -409,16 +413,13 @@ async fn daemon_unexpected_frame() {
 #[tokio::test]
 async fn kill_server_no_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Kill-server with zero sessions (empty drain path).
-    let (ctl_path, _) = unique_socks("killsrv-empty");
+    let ctl_path = unique_ctl("killsrv-empty");
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
     let daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Kill immediately — no sessions created
     let resp = control_request(&ctl_path, Frame::KillServer).await;
     assert_eq!(resp, Frame::Ok);
 
@@ -434,19 +435,17 @@ async fn kill_server_no_sessions() {
 #[tokio::test]
 async fn kill_nonexistent_session() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (ctl_path, _) = unique_socks("kill-nonexist");
+    let ctl_path = unique_ctl("kill-nonexist");
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Kill a session that was never created
     let resp = control_request(
         &ctl_path,
         Frame::KillSession {
-            path: "/tmp/does-not-exist.sock".to_string(),
+            session: "999".to_string(),
         },
     )
     .await;
@@ -461,27 +460,25 @@ async fn kill_nonexistent_session() {
 #[tokio::test]
 async fn session_natural_exit_reaps_from_list() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // When a shell exits naturally, the daemon should reap it from the session list.
-    let (ctl_path, session_path) = unique_socks("natural-reap");
+    let ctl_path = unique_ctl("natural-reap");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    create_session(&ctl_path, &session_path).await;
+    let _id = create_session(&ctl_path, "reapme").await;
 
-    // Wait for shell to actually start (metadata shows PID > 0), then SIGTERM it.
-    // This tests the daemon's reaping path when a shell dies on its own (not via KillSession).
+    // Wait for shell to start (PID > 0)
     let shell_pid;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
+            Frame::SessionInfo { sessions }
+                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
+            {
                 shell_pid = sessions[0].shell_pid;
                 break;
             }
@@ -490,13 +487,12 @@ async fn session_natural_exit_reaps_from_list() {
         }
     }
 
-    // Send SIGKILL to the shell — this is "natural" from the daemon's perspective
-    // (the shell dies on its own, not via KillSession)
+    // Kill the shell externally
     unsafe {
         libc::kill(shell_pid as i32, libc::SIGKILL);
     }
 
-    // Poll list until sessions is empty (shell exit + server task finish + reap)
+    // Poll list until sessions is empty
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -512,34 +508,32 @@ async fn session_natural_exit_reaps_from_list() {
     }
 
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 }
 
 #[tokio::test]
 async fn list_before_session_ready() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // List sessions immediately after create, before the session has fully started.
-    // Metadata may not be set yet — should show empty/zero fields gracefully.
-    let (ctl_path, session_path) = unique_socks("list-early");
+    let ctl_path = unique_ctl("list-early");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Create session (don't wait the usual 200ms)
+    // Create session via NewSession (don't wait the usual 200ms from helper)
     let resp = control_request(
         &ctl_path,
-        Frame::CreateSession {
-            path: session_path.display().to_string(),
+        Frame::NewSession {
+            name: "early".to_string(),
         },
     )
     .await;
-    assert_eq!(resp, Frame::Ok);
+    let id = match resp {
+        Frame::SessionCreated { id } => id,
+        other => panic!("expected SessionCreated, got {other:?}"),
+    };
 
-    // List immediately — session should appear (possibly with empty metadata)
+    // List immediately
     let resp = control_request(&ctl_path, Frame::ListSessions).await;
     match &resp {
         Frame::SessionInfo { sessions } => {
@@ -548,56 +542,47 @@ async fn list_before_session_ready() {
                 1,
                 "session should appear in list immediately"
             );
-            assert_eq!(sessions[0].path, session_path.display().to_string());
-            // shell_pid might be 0 if metadata isn't ready yet — that's fine
+            assert_eq!(sessions[0].id, id);
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
 
-    // Wait for it to fully start, then clean up
     tokio::time::sleep(Duration::from_millis(300)).await;
-    kill_cleanup(&ctl_path, &session_path).await;
+    kill_cleanup(&ctl_path, &id).await;
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 }
 
 #[tokio::test]
 async fn kill_session_while_client_connected() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // When daemon kills a session, a connected client should see the connection break.
-    let (ctl_path, session_path) = unique_socks("kill-connected");
+    let ctl_path = unique_ctl("kill-connected");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    create_session(&ctl_path, &session_path).await;
+    let id = create_session(&ctl_path, "kill-conn").await;
 
-    // Connect a client
-    let mut framed = connect_session(&session_path).await;
+    // Attach a client
+    let mut framed = attach_session(&ctl_path, &id).await;
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
     // Kill the session via daemon while client is connected
     let resp = control_request(
         &ctl_path,
         Frame::KillSession {
-            path: session_path.display().to_string(),
+            session: id.clone(),
         },
     )
     .await;
     assert_eq!(resp, Frame::Ok);
 
-    // Client should see the stream end (None or error)
+    // Client should see the stream end
     let result = timeout(Duration::from_secs(3), framed.next()).await;
     match result {
-        Ok(None) | Ok(Some(Err(_))) | Err(_) => {
-            // Expected: stream ended or error — client detected kill
-        }
+        Ok(None) | Ok(Some(Err(_))) | Err(_) => {}
         Ok(Some(Ok(Frame::Data(_)))) => {
-            // Might get some buffered data first; keep reading
             let end = timeout(Duration::from_secs(2), framed.next()).await;
             assert!(
                 matches!(end, Ok(None) | Ok(Some(Err(_))) | Err(_)),
@@ -610,31 +595,28 @@ async fn kill_session_while_client_connected() {
     }
 
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 }
 
 #[tokio::test]
 async fn session_metadata_has_pty_and_pid() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    // Verify that list-sessions returns real PTY path and PID.
-    let (ctl_path, session_path) = unique_socks("meta-info");
+    let ctl_path = unique_ctl("meta-info");
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
-
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    create_session(&ctl_path, &session_path).await;
+    let id = create_session(&ctl_path, "metacheck").await;
 
-    // Poll until metadata is populated
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
+            Frame::SessionInfo { sessions }
+                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
+            {
                 let s = &sessions[0];
                 assert!(
                     s.pty_path.starts_with("/dev/pts/") || s.pty_path.starts_with("/dev/tty"),
@@ -649,7 +631,101 @@ async fn session_metadata_has_pty_and_pid() {
         }
     }
 
-    kill_cleanup(&ctl_path, &session_path).await;
+    kill_cleanup(&ctl_path, &id).await;
     let _ = std::fs::remove_file(&ctl_path);
-    let _ = std::fs::remove_file(&session_path);
+}
+
+#[tokio::test]
+async fn attach_to_session() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("attach");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "attachme").await;
+
+    // Attach via the daemon
+    let mut framed = attach_session(&ctl_path, &id).await;
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+
+    framed
+        .send(Frame::Data(Bytes::from("echo ATTACH_OK\n")))
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(Duration::from_secs(2), framed.next()).await
+    {
+        output.extend_from_slice(&data);
+    }
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("ATTACH_OK"),
+        "should be able to interact after attach, got: {output_str}"
+    );
+
+    kill_cleanup(&ctl_path, &id).await;
+    let _ = std::fs::remove_file(&ctl_path);
+}
+
+#[tokio::test]
+async fn attach_by_name() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("attach-name");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "namedattach").await;
+
+    // Attach by name
+    let mut framed = attach_session(&ctl_path, "namedattach").await;
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+
+    framed
+        .send(Frame::Data(Bytes::from("echo NAME_ATTACH_OK\n")))
+        .await
+        .unwrap();
+    let mut output = Vec::new();
+    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(Duration::from_secs(2), framed.next()).await
+    {
+        output.extend_from_slice(&data);
+    }
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("NAME_ATTACH_OK"),
+        "should be able to attach by name, got: {output_str}"
+    );
+
+    kill_cleanup(&ctl_path, &id).await;
+    let _ = std::fs::remove_file(&ctl_path);
+}
+
+#[tokio::test]
+async fn attach_nonexistent_returns_error() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("attach-noexist");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach {
+            session: "nonexistent".to_string(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, Frame::Error { .. }),
+        "expected Error for nonexistent attach, got {resp:?}"
+    );
+
+    let _ = std::fs::remove_file(&ctl_path);
 }

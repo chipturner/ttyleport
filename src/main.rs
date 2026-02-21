@@ -15,12 +15,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new persistent session
+    /// Create a new persistent session (auto-attaches)
     #[command(alias = "new", alias = "serve")]
     NewSession {
-        /// Session name or socket path
+        /// Session name (optional; sessions always get an auto-incrementing id)
         #[arg(short = 't', long = "target")]
-        target: String,
+        target: Option<String>,
 
         /// Run the daemon in the foreground (don't fork)
         #[arg(long)]
@@ -29,7 +29,7 @@ enum Command {
     /// Attach to an existing session (detaches other clients)
     #[command(alias = "a", alias = "connect")]
     Attach {
-        /// Session name or socket path
+        /// Session id or name
         #[arg(short = 't', long = "target")]
         target: String,
     },
@@ -38,30 +38,12 @@ enum Command {
     ListSessions,
     /// Kill a specific session
     KillSession {
-        /// Session name or socket path
+        /// Session id or name
         #[arg(short = 't', long = "target")]
         target: String,
     },
     /// Kill the daemon and all sessions
     KillServer,
-}
-
-/// Resolve a session target to a socket path.
-/// If the target contains a `/`, treat it as a literal path.
-/// Otherwise, resolve to `$XDG_RUNTIME_DIR/ttyleport/sessions/<name>.sock`
-/// (or `/tmp/ttyleport-$UID/sessions/<name>.sock`).
-fn resolve_target(target: &str) -> PathBuf {
-    if target.contains('/') {
-        PathBuf::from(target)
-    } else {
-        let base = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            PathBuf::from(xdg).join("ttyleport")
-        } else {
-            let uid = unsafe { libc::getuid() };
-            PathBuf::from(format!("/tmp/ttyleport-{uid}"))
-        };
-        base.join("sessions").join(format!("{target}.sock"))
-    }
 }
 
 #[tokio::main]
@@ -77,25 +59,20 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(ttyleport::daemon::control_socket_path);
     match cli.command {
         Command::NewSession { target, foreground } => {
-            let socket = resolve_target(&target);
-            new_session(socket, foreground, ctl_path).await
+            new_session(target, foreground, ctl_path).await
         }
         Command::Attach { target } => {
-            let socket = resolve_target(&target);
-            let code = ttyleport::client::run(&socket).await?;
+            let code = attach(target, ctl_path).await?;
             std::process::exit(code);
         }
         Command::ListSessions => list_sessions(ctl_path).await,
-        Command::KillSession { target } => {
-            let socket = resolve_target(&target);
-            kill_session(socket, ctl_path).await
-        }
+        Command::KillSession { target } => kill_session(target, ctl_path).await,
         Command::KillServer => kill_server(ctl_path).await,
     }
 }
 
 async fn new_session(
-    session_socket: PathBuf,
+    name: Option<String>,
     foreground: bool,
     ctl_path: PathBuf,
 ) -> anyhow::Result<()> {
@@ -104,31 +81,27 @@ async fn new_session(
     use tokio_util::codec::Framed;
     use ttyleport::protocol::{Frame, FrameCodec};
 
-    // Ensure the sessions directory exists
-    if let Some(parent) = session_socket.parent() {
-        ttyleport::security::secure_create_dir_all(parent)?;
-    }
+    let session_name = name.clone().unwrap_or_default();
 
     if foreground {
-        let session = session_socket.clone();
         let ctl_for_spawn = ctl_path.clone();
+        let name_for_spawn = session_name.clone();
         tokio::spawn(async move {
-            let ctl_path = ctl_for_spawn;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-            let Ok(stream) = UnixStream::connect(&ctl_path).await else {
+            let Ok(stream) = UnixStream::connect(&ctl_for_spawn).await else {
                 eprintln!("error: failed to connect to daemon control socket");
                 return;
             };
             let mut framed = Framed::new(stream, FrameCodec);
             let _ = framed
-                .send(Frame::CreateSession {
-                    path: session.display().to_string(),
+                .send(Frame::NewSession {
+                    name: name_for_spawn,
                 })
                 .await;
             match framed.next().await {
-                Some(Ok(Frame::Ok)) => {
-                    eprintln!("session created: {}", session.display());
+                Some(Ok(Frame::SessionCreated { id })) => {
+                    eprintln!("session created: id {id}");
                 }
                 Some(Ok(Frame::Error { message })) => {
                     eprintln!("error: {message}");
@@ -169,15 +142,17 @@ async fn new_session(
         let stream = UnixStream::connect(&ctl_path).await?;
         let mut framed = Framed::new(stream, FrameCodec);
         framed
-            .send(Frame::CreateSession {
-                path: session_socket.display().to_string(),
+            .send(Frame::NewSession {
+                name: session_name,
             })
             .await?;
 
         match framed.next().await {
-            Some(Ok(Frame::Ok)) => {
-                eprintln!("session created: {}", session_socket.display());
-                Ok(())
+            Some(Ok(Frame::SessionCreated { id })) => {
+                eprintln!("session created: id {id}");
+                // Auto-attach: the daemon already handed off our connection to the session
+                let code = ttyleport::client::run(&ctl_path, &id, framed).await?;
+                std::process::exit(code);
             }
             Some(Ok(Frame::Error { message })) => {
                 anyhow::bail!("{message}");
@@ -185,6 +160,36 @@ async fn new_session(
             other => {
                 anyhow::bail!("unexpected response from daemon: {other:?}");
             }
+        }
+    }
+}
+
+async fn attach(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::UnixStream;
+    use tokio_util::codec::Framed;
+    use ttyleport::protocol::{Frame, FrameCodec};
+
+    let stream = UnixStream::connect(&ctl_path)
+        .await
+        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {ctl_path:?})"))?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed
+        .send(Frame::Attach {
+            session: target.clone(),
+        })
+        .await?;
+
+    match framed.next().await {
+        Some(Ok(Frame::Ok)) => {
+            let code = ttyleport::client::run(&ctl_path, &target, framed).await?;
+            Ok(code)
+        }
+        Some(Ok(Frame::Error { message })) => {
+            anyhow::bail!("{message}");
+        }
+        other => {
+            anyhow::bail!("unexpected response from daemon: {other:?}");
         }
     }
 }
@@ -221,13 +226,15 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
             } else {
                 for s in &sessions {
                     let status = if s.attached { "attached" } else { "detached" };
-                    if s.shell_pid > 0 {
-                        println!(
-                            "{}: {} (pid {}) ({})",
-                            s.path, s.pty_path, s.shell_pid, status
-                        );
+                    let label = if s.name.is_empty() {
+                        s.id.clone()
                     } else {
-                        println!("{}: (starting...)", s.path);
+                        format!("{}: {}", s.id, s.name)
+                    };
+                    if s.shell_pid > 0 {
+                        println!("{label}: {} (pid {}) ({status})", s.pty_path, s.shell_pid);
+                    } else {
+                        println!("{label}: (starting...)");
                     }
                 }
             }
@@ -239,19 +246,19 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
-async fn kill_session(socket: PathBuf, ctl_path: PathBuf) -> anyhow::Result<()> {
+async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
     use ttyleport::protocol::Frame;
 
     match daemon_request(
         &ctl_path,
         Frame::KillSession {
-            path: socket.display().to_string(),
+            session: target.clone(),
         },
     )
     .await?
     {
         Frame::Ok => {
-            eprintln!("session killed: {}", socket.display());
+            eprintln!("session killed: {target}");
             Ok(())
         }
         Frame::Error { message } => anyhow::bail!("{message}"),

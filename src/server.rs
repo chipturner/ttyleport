@@ -4,14 +4,15 @@ use futures_util::{SinkExt, StreamExt};
 use nix::pty::openpty;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::unix::AsyncFd;
+use tokio::net::UnixStream;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub struct SessionMetadata {
     pub pty_path: String,
@@ -53,12 +54,9 @@ enum RelayExit {
 }
 
 pub async fn run(
-    socket_path: &Path,
+    mut client_rx: mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
 ) -> anyhow::Result<()> {
-    let listener = crate::security::bind_unix_listener(socket_path)?;
-    info!(path = %socket_path.display(), "listening");
-
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
     let master: OwnedFd = pty.master;
@@ -114,18 +112,20 @@ pub async fn run(
     let async_master = AsyncFd::new(master)?;
     let mut buf = vec![0u8; 4096];
 
-    // Outer loop: accept clients. PTY persists across reconnects.
+    // Outer loop: accept clients via channel. PTY persists across reconnects.
     loop {
-        // Wait for either a new client or the shell to exit
-        let stream = tokio::select! {
-            result = listener.accept() => {
-                let (stream, _addr) = result?;
-                if let Err(e) = crate::security::verify_peer_uid(&stream) {
-                    warn!("{e}");
-                    continue;
+        let framed = tokio::select! {
+            client = client_rx.recv() => {
+                match client {
+                    Some(framed) => {
+                        info!("client connected via channel");
+                        framed
+                    }
+                    None => {
+                        info!("client channel closed");
+                        break;
+                    }
                 }
-                info!("client connected");
-                stream
             }
             status = managed.child.wait() => {
                 let code = status?.code().unwrap_or(1);
@@ -138,7 +138,7 @@ pub async fn run(
             meta.attached.store(true, Ordering::Relaxed);
         }
 
-        let mut framed = Framed::new(stream, FrameCodec);
+        let mut framed = framed;
 
         // Inner loop: relay between socket and PTY
         let exit = loop {
@@ -177,7 +177,7 @@ pub async fn run(
                         Some(Ok(Frame::Exit { .. })) | None => {
                             break RelayExit::ClientGone;
                         }
-                        // Control frames ignored on session sockets
+                        // Control frames ignored on session connections
                         Some(Ok(_)) => {}
                         Some(Err(e)) => return Err(e.into()),
                     }
@@ -207,16 +207,12 @@ pub async fn run(
                     }
                 }
 
-                result = listener.accept() => {
-                    // New client takeover: detach old client, switch to new
-                    if let Ok((new_stream, _)) = result {
-                        if let Err(e) = crate::security::verify_peer_uid(&new_stream) {
-                            warn!("{e}");
-                            continue;
-                        }
-                        info!("new client connected, detaching old client");
+                // Client takeover via channel
+                new_client = client_rx.recv() => {
+                    if let Some(new_framed) = new_client {
+                        info!("new client via channel, detaching old client");
                         let _ = framed.send(Frame::Detached).await;
-                        framed = Framed::new(new_stream, FrameCodec);
+                        framed = new_framed;
                     }
                 }
 
@@ -249,6 +245,5 @@ pub async fn run(
         }
     }
 
-    let _ = std::fs::remove_file(socket_path);
     Ok(())
 }

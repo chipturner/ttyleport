@@ -92,11 +92,59 @@ fn decode_invalid_type_returns_error() {
 }
 
 #[test]
-fn roundtrip_create_session() {
+fn roundtrip_new_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::CreateSession {
-        path: "/tmp/test.sock".to_string(),
+    let original = Frame::NewSession {
+        name: "myproject".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_new_session_empty_name() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::NewSession {
+        name: String::new(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_attach() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Attach {
+        session: "0".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_attach_by_name() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Attach {
+        session: "myproject".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_session_created() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::SessionCreated {
+        id: "42".to_string(),
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -119,14 +167,16 @@ fn roundtrip_session_info() {
     let original = Frame::SessionInfo {
         sessions: vec![
             SessionEntry {
-                path: "/tmp/a.sock".to_string(),
+                id: "0".to_string(),
+                name: "project-a".to_string(),
                 pty_path: "/dev/pts/3".to_string(),
                 shell_pid: 1234,
                 created_at: 1700000000,
                 attached: true,
             },
             SessionEntry {
-                path: "/tmp/b.sock".to_string(),
+                id: "1".to_string(),
+                name: String::new(),
                 pty_path: "/dev/pts/5".to_string(),
                 shell_pid: 5678,
                 created_at: 1700000100,
@@ -184,7 +234,19 @@ fn roundtrip_kill_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::KillSession {
-        path: "/tmp/test.sock".to_string(),
+        session: "0".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_kill_session_by_name() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::KillSession {
+        session: "myproject".to_string(),
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -263,18 +325,6 @@ fn roundtrip_error_empty_message() {
 }
 
 #[test]
-fn roundtrip_create_session_empty_path() {
-    let mut codec = FrameCodec;
-    let mut buf = BytesMut::new();
-    let original = Frame::CreateSession {
-        path: String::new(),
-    };
-    codec.encode(original.clone(), &mut buf).unwrap();
-    let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(original, decoded);
-}
-
-#[test]
 fn resize_wrong_payload_size_too_short() {
     let mut codec = FrameCodec;
     // Resize frame type (0x02) with only 3 bytes payload instead of 4
@@ -293,13 +343,14 @@ fn exit_wrong_payload_size() {
 }
 
 #[test]
-fn session_info_with_tabs_in_path() {
-    // Tabs in paths would corrupt the tab-separated wire format
+fn session_info_with_tabs_in_id() {
+    // Tabs in id would corrupt the tab-separated wire format
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
         sessions: vec![SessionEntry {
-            path: "/tmp/has\ttab.sock".to_string(),
+            id: "has\ttab".to_string(),
+            name: "test".to_string(),
             pty_path: "/dev/pts/3".to_string(),
             shell_pid: 1234,
             created_at: 1700000000,
@@ -308,15 +359,13 @@ fn session_info_with_tabs_in_path() {
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    // This WILL differ because the tab splits the field incorrectly
-    // The decoder sees 6 tab-separated fields instead of 5, so filter_map drops the line
+    // The tab splits the field incorrectly — 7 fields instead of 6, so filter_map drops the line
     match decoded {
         Frame::SessionInfo { sessions } => {
-            // The entry is lost because the tab corrupts parsing
             assert_eq!(
                 sessions.len(),
                 0,
-                "tab in path corrupts wire format — entry should be dropped"
+                "tab in id corrupts wire format — entry should be dropped"
             );
         }
         other => panic!("expected SessionInfo, got {other:?}"),
@@ -357,7 +406,7 @@ fn decode_consumes_only_one_frame() {
     assert_eq!(first, Frame::Data(Bytes::from("first")));
     // Buffer should still have the second frame
     assert!(buf.len() < total_len);
-    assert!(buf.len() > 0);
+    assert!(!buf.is_empty());
 
     let second = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(second, Frame::Data(Bytes::from("second")));
@@ -365,16 +414,17 @@ fn decode_consumes_only_one_frame() {
 }
 
 #[test]
-fn session_info_with_newline_in_path() {
-    // Newlines in paths corrupt the line-separated wire format.
-    // The newline splits one entry into two lines:
-    //   "/tmp/has" (1 field, dropped) and
-    //   "newline.sock\t/dev/pts/3\t1234\t1700000000\t1" (5 fields, parsed as corrupted entry)
+fn session_info_with_newline_in_name() {
+    // Newlines in names corrupt the line-separated wire format.
+    // Wire: "0\thas\nnewline\t/dev/pts/3\t1234\t1700000000\t1"
+    // Splits into: "0\thas" (2 fields, dropped) and "newline\t/dev/pts/3\t1234\t1700000000\t1" (5 fields, dropped)
+    // Neither fragment has 6 fields, so both are dropped.
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
         sessions: vec![SessionEntry {
-            path: "/tmp/has\nnewline.sock".to_string(),
+            id: "0".to_string(),
+            name: "has\nnewline".to_string(),
             pty_path: "/dev/pts/3".to_string(),
             shell_pid: 1234,
             created_at: 1700000000,
@@ -385,10 +435,11 @@ fn session_info_with_newline_in_path() {
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     match decoded {
         Frame::SessionInfo { sessions } => {
-            // Second half of the split happens to have 5 tab-separated fields,
-            // so it parses as a corrupted entry with wrong path
-            assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].path, "newline.sock");
+            assert_eq!(
+                sessions.len(),
+                0,
+                "newline in name corrupts wire format — entry should be dropped"
+            );
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -397,9 +448,9 @@ fn session_info_with_newline_in_path() {
 #[test]
 fn invalid_utf8_in_string_frame() {
     let mut codec = FrameCodec;
-    // CreateSession (0x10) with invalid UTF-8 payload
+    // NewSession (0x10) with invalid UTF-8 payload
     let mut buf = BytesMut::new();
-    buf.put_u8(0x10); // TYPE_CREATE_SESSION
+    buf.put_u8(0x10); // TYPE_NEW_SESSION
     buf.put_u32(2);
     buf.put_slice(&[0xFF, 0xFE]); // invalid UTF-8
     let err = codec.decode(&mut buf).unwrap_err();

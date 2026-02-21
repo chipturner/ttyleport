@@ -92,22 +92,29 @@ fn get_terminal_size() -> (u16, u16) {
     (ws.ws_col, ws.ws_row)
 }
 
-async fn connect(socket_path: &Path) -> io::Result<Framed<UnixStream, FrameCodec>> {
-    let stream = loop {
-        match UnixStream::connect(socket_path).await {
-            Ok(s) => break s,
-            Err(e)
-                if e.kind() == io::ErrorKind::ConnectionRefused
-                    || e.kind() == io::ErrorKind::NotFound =>
-            {
-                debug!(path = %socket_path.display(), "waiting for session...");
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-            Err(e) => return Err(e),
+/// Connect to daemon and send Attach, returning the framed connection on success.
+async fn reconnect(
+    daemon_socket: &Path,
+    session: &str,
+) -> io::Result<Framed<UnixStream, FrameCodec>> {
+    let stream = UnixStream::connect(daemon_socket).await?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed
+        .send(Frame::Attach {
+            session: session.to_string(),
+        })
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e))?;
+    match framed.next().await {
+        Some(Ok(Frame::Ok)) => Ok(framed),
+        Some(Ok(Frame::Error { message })) => {
+            Err(io::Error::new(io::ErrorKind::NotFound, message))
         }
-    };
-    info!(path = %socket_path.display(), "connected");
-    Ok(Framed::new(stream, FrameCodec))
+        _ => Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "unexpected response from daemon",
+        )),
+    }
 }
 
 /// Send a frame with a timeout. Returns false if the send failed or timed out.
@@ -196,10 +203,11 @@ async fn relay(
     }
 }
 
-pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
-    // First connection before raw mode so Ctrl-C works while waiting
-    let mut framed = connect(socket_path).await?;
-
+pub async fn run(
+    daemon_socket: &Path,
+    session: &str,
+    mut framed: Framed<UnixStream, FrameCodec>,
+) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     // Safety: stdin lives for the duration of the program
@@ -224,7 +232,15 @@ pub async fn run(socket_path: &Path) -> anyhow::Result<i32> {
                 // Select on both so the user can kill the client during reconnect.
                 framed = loop {
                     tokio::select! {
-                        result = connect(socket_path) => break result?,
+                        result = reconnect(daemon_socket, session) => {
+                            match result {
+                                Ok(f) => break f,
+                                Err(e) => {
+                                    debug!("reconnect failed: {e}, retrying...");
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                            }
+                        }
                         ready = async_stdin.readable() => {
                             let mut guard = ready?;
                             if let Ok(Ok(n)) = guard.try_io(|inner| inner.get_ref().read(&mut buf))
