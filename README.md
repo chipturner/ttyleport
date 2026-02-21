@@ -55,8 +55,11 @@ ttyleport new -t project
 **From your laptop**, forward the socket and attach:
 
 ```bash
+# Get the remote socket path
+REMOTE_SOCK=$(ssh user@remote-host ttyleport socket-path)
+
 # Forward the remote daemon socket to a local path
-ssh -L /tmp/ttyleport-remote.sock:${XDG_RUNTIME_DIR}/ttyleport/ctl.sock user@remote-host -N &
+ssh -L /tmp/ttyleport-remote.sock:$REMOTE_SOCK user@remote-host -N &
 
 # Attach to the remote session via the forwarded socket
 ttyleport --ctl-socket /tmp/ttyleport-remote.sock attach -t project
@@ -67,7 +70,7 @@ Close your laptop, switch networks, reconnect SSH — the client detects the dea
 **Tip:** Use [autossh](https://www.harding.motd.ca/autossh/) to keep the SSH tunnel alive automatically:
 
 ```bash
-autossh -M 0 -L /tmp/ttyleport-remote.sock:${XDG_RUNTIME_DIR}/ttyleport/ctl.sock user@remote-host -N
+autossh -M 0 -L /tmp/ttyleport-remote.sock:$REMOTE_SOCK user@remote-host -N
 ```
 
 ## Commands
@@ -80,6 +83,7 @@ autossh -M 0 -L /tmp/ttyleport-remote.sock:${XDG_RUNTIME_DIR}/ttyleport/ctl.sock
 | `ttyleport list-sessions` | `ls`, `list` | List active sessions |
 | `ttyleport kill-session -t <id\|name>` | | Kill a session |
 | `ttyleport kill-server` | | Kill the daemon and all sessions |
+| `ttyleport socket-path` | `socket` | Print the default socket path |
 
 **Options:**
 - `-t <name>` on `new-session`: give the session a human-friendly name

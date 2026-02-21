@@ -47,6 +47,9 @@ enum Command {
     },
     /// Kill the daemon and all sessions
     KillServer,
+    /// Print the default socket path
+    #[command(alias = "socket")]
+    SocketPath,
 }
 
 #[tokio::main]
@@ -77,6 +80,10 @@ async fn run() -> anyhow::Result<()> {
         Command::ListSessions => list_sessions(ctl_path).await,
         Command::KillSession { target } => kill_session(target, ctl_path).await,
         Command::KillServer => kill_server(ctl_path).await,
+        Command::SocketPath => {
+            println!("{}", ctl_path.display());
+            Ok(())
+        }
     }
 }
 
