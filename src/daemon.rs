@@ -18,14 +18,14 @@ struct SessionState {
     name: Option<String>,
 }
 
-/// Returns the base directory for ttyleport sockets.
-/// Prefers $XDG_RUNTIME_DIR/ttyleport, falls back to /tmp/ttyleport-$UID.
+/// Returns the base directory for gritty sockets.
+/// Prefers $XDG_RUNTIME_DIR/gritty, falls back to /tmp/gritty-$UID.
 pub fn socket_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("ttyleport")
+        PathBuf::from(xdg).join("gritty")
     } else {
         let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/ttyleport-{uid}"))
+        PathBuf::from(format!("/tmp/gritty-{uid}"))
     }
 }
 

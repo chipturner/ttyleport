@@ -63,7 +63,7 @@ debug-session name="test":
 
 # Launch 3-pane tmux manual test (server + socat bridge + client)
 quicktest:
-    tmux -L ttyleport-test start-server\; source-file quicktest.tmux
+    tmux -L gritty-test start-server\; source-file quicktest.tmux
 
 # Test coverage summary
 coverage:

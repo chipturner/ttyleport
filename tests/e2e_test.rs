@@ -7,7 +7,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use ttyleport::protocol::{Frame, FrameCodec};
+use gritty::protocol::{Frame, FrameCodec};
 
 /// Limit concurrent e2e tests to avoid PTY/CPU exhaustion under parallel load.
 static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
@@ -18,12 +18,12 @@ async fn setup_session() -> (
     mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
     Framed<UnixStream, FrameCodec>,
     JoinHandle<anyhow::Result<()>>,
-    Arc<OnceLock<ttyleport::server::SessionMetadata>>,
+    Arc<OnceLock<gritty::server::SessionMetadata>>,
 ) {
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
-    let handle = tokio::spawn(async move { ttyleport::server::run(client_rx, meta_clone).await });
+    let handle = tokio::spawn(async move { gritty::server::run(client_rx, meta_clone).await });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx
@@ -42,12 +42,12 @@ async fn setup_session_with_env(
     mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
     Framed<UnixStream, FrameCodec>,
     JoinHandle<anyhow::Result<()>>,
-    Arc<OnceLock<ttyleport::server::SessionMetadata>>,
+    Arc<OnceLock<gritty::server::SessionMetadata>>,
 ) {
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
-    let handle = tokio::spawn(async move { ttyleport::server::run(client_rx, meta_clone).await });
+    let handle = tokio::spawn(async move { gritty::server::run(client_rx, meta_clone).await });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx

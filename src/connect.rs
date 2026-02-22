@@ -108,7 +108,7 @@ async fn remote_exec(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         if stderr.contains("command not found") || stderr.contains("No such file") {
-            bail!("ttyleport not found on remote host (is it in PATH?)");
+            bail!("gritty not found on remote host (is it in PATH?)");
         }
         bail!("ssh command failed: {stderr}");
     }
@@ -247,9 +247,9 @@ async fn tunnel_monitor(
 // ---------------------------------------------------------------------------
 
 const REMOTE_ENSURE_CMD: &str = "\
-    SOCK=$(ttyleport socket-path) && \
-    (ttyleport ls >/dev/null 2>&1 || \
-     { nohup ttyleport daemon </dev/null >/dev/null 2>&1 & sleep 0.5; }) && \
+    SOCK=$(gritty socket-path) && \
+    (gritty ls >/dev/null 2>&1 || \
+     { nohup gritty daemon </dev/null >/dev/null 2>&1 & sleep 0.5; }) && \
     echo \"$SOCK\"";
 
 /// Get the remote socket path and optionally auto-start the daemon.
@@ -259,7 +259,7 @@ async fn ensure_remote_ready(
     extra_ssh_opts: &[String],
 ) -> anyhow::Result<String> {
     let remote_cmd = if no_daemon_start {
-        "ttyleport socket-path"
+        "gritty socket-path"
     } else {
         REMOTE_ENSURE_CMD
     };
@@ -396,7 +396,7 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
 
     // --ls: list remote sessions and exit
     if opts.list {
-        let output = remote_exec(&dest, "ttyleport ls", &opts.ssh_options).await?;
+        let output = remote_exec(&dest, "gritty ls", &opts.ssh_options).await?;
         println!("{output}");
         return Ok(0);
     }
@@ -520,7 +520,7 @@ mod tests {
         let cmd = tunnel_command(
             &dest,
             Path::new("/tmp/local.sock"),
-            "/run/user/1000/ttyleport/ctl.sock",
+            "/run/user/1000/gritty/ctl.sock",
             &[],
         );
         let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
@@ -530,7 +530,7 @@ mod tests {
         assert!(args.contains(&"ConnectTimeout=5".to_string()));
         assert!(args.contains(&"-N".to_string()));
         assert!(args.contains(&"-T".to_string()));
-        assert!(args.contains(&"/tmp/local.sock:/run/user/1000/ttyleport/ctl.sock".to_string()));
+        assert!(args.contains(&"/tmp/local.sock:/run/user/1000/gritty/ctl.sock".to_string()));
         assert!(args.contains(&"user@host".to_string()));
     }
 
@@ -555,9 +555,9 @@ mod tests {
         let filename = path.file_name().unwrap().to_string_lossy();
         assert!(filename.starts_with("connect-"));
         assert!(filename.ends_with(".sock"));
-        // Parent should be a ttyleport directory
+        // Parent should be a gritty directory
         let parent = path.parent().unwrap().file_name().unwrap().to_string_lossy();
-        assert!(parent.contains("ttyleport"));
+        assert!(parent.contains("gritty"));
     }
 
     #[test]

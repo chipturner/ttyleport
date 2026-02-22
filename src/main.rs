@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "ttyleport", about = "Teleport a TTY over a socket")]
+#[command(name = "gritty", about = "Persistent TTY sessions over Unix domain sockets")]
 struct Cli {
     /// Path to the daemon control socket (overrides default)
     #[arg(long, global = true)]
@@ -111,9 +111,9 @@ async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let ctl_path = cli
         .ctl_socket
-        .unwrap_or_else(ttyleport::daemon::control_socket_path);
+        .unwrap_or_else(gritty::daemon::control_socket_path);
     match cli.command {
-        Command::Daemon => ttyleport::daemon::run(&ctl_path).await,
+        Command::Daemon => gritty::daemon::run(&ctl_path).await,
         Command::NewSession { target, no_escape } => new_session(target, no_escape, ctl_path).await,
         Command::Attach { target, no_redraw, no_escape } => {
             let code = attach(target, !no_redraw, no_escape, ctl_path).await?;
@@ -136,7 +136,7 @@ async fn run() -> anyhow::Result<()> {
             no_escape,
             ssh_options,
         } => {
-            let code = ttyleport::connect::run(ttyleport::connect::ConnectOpts {
+            let code = gritty::connect::run(gritty::connect::ConnectOpts {
                 destination,
                 target,
                 force_new: new,
@@ -156,7 +156,7 @@ async fn new_session(name: Option<String>, no_escape: bool, ctl_path: PathBuf) -
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use ttyleport::protocol::{Frame, FrameCodec};
+    use gritty::protocol::{Frame, FrameCodec};
 
     let session_name = name.clone().unwrap_or_default();
 
@@ -176,8 +176,8 @@ async fn new_session(name: Option<String>, no_escape: bool, ctl_path: PathBuf) -
                 Some(n) => eprintln!("session created: {n} (id {id})"),
                 None => eprintln!("session created: id {id}"),
             }
-            let env_vars = ttyleport::collect_env_vars();
-            let code = ttyleport::client::run(&id, framed, false, &ctl_path, env_vars, no_escape).await?;
+            let env_vars = gritty::collect_env_vars();
+            let code = gritty::client::run(&id, framed, false, &ctl_path, env_vars, no_escape).await?;
             std::process::exit(code);
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -189,7 +189,7 @@ async fn attach(target: String, redraw: bool, no_escape: bool, ctl_path: PathBuf
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use ttyleport::protocol::{Frame, FrameCodec};
+    use gritty::protocol::{Frame, FrameCodec};
 
     let stream = loop {
         match UnixStream::connect(&ctl_path).await {
@@ -210,7 +210,7 @@ async fn attach(target: String, redraw: bool, no_escape: bool, ctl_path: PathBuf
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
             eprintln!("[attached]");
-            let code = ttyleport::client::run(&target, framed, redraw, &ctl_path, vec![], no_escape).await?;
+            let code = gritty::client::run(&target, framed, redraw, &ctl_path, vec![], no_escape).await?;
             Ok(code)
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -221,12 +221,12 @@ async fn attach(target: String, redraw: bool, no_escape: bool, ctl_path: PathBuf
 /// Send a control frame to the daemon and return the response.
 async fn daemon_request(
     ctl_path: &PathBuf,
-    frame: ttyleport::protocol::Frame,
-) -> anyhow::Result<ttyleport::protocol::Frame> {
+    frame: gritty::protocol::Frame,
+) -> anyhow::Result<gritty::protocol::Frame> {
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use ttyleport::protocol::{Frame, FrameCodec};
+    use gritty::protocol::{Frame, FrameCodec};
 
     let stream = UnixStream::connect(ctl_path)
         .await
@@ -237,7 +237,7 @@ async fn daemon_request(
 }
 
 async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
-    use ttyleport::protocol::Frame;
+    use gritty::protocol::Frame;
 
     let resp = daemon_request(&ctl_path, Frame::ListSessions).await?;
     match resp {
@@ -281,7 +281,7 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
 }
 
 async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
-    use ttyleport::protocol::Frame;
+    use gritty::protocol::Frame;
 
     match daemon_request(
         &ctl_path,
@@ -301,7 +301,7 @@ async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
 }
 
 async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
-    use ttyleport::protocol::Frame;
+    use gritty::protocol::Frame;
 
     match daemon_request(&ctl_path, Frame::KillServer).await? {
         Frame::Ok => {

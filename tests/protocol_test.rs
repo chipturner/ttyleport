@@ -1,6 +1,6 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
-use ttyleport::protocol::{Frame, FrameCodec, SessionEntry};
+use gritty::protocol::{Frame, FrameCodec, SessionEntry};
 
 #[test]
 fn encode_data_frame() {

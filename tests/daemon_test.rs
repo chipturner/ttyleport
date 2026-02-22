@@ -7,7 +7,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use ttyleport::protocol::{Frame, FrameCodec};
+use gritty::protocol::{Frame, FrameCodec};
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -18,7 +18,7 @@ static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(3));
 fn unique_ctl(label: &str) -> std::path::PathBuf {
     let pid = std::process::id();
     let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("ttyleport-d-{label}-{pid}-{seq}-ctl.sock"))
+    std::env::temp_dir().join(format!("gritty-d-{label}-{pid}-{seq}-ctl.sock"))
 }
 
 /// Helper: send a control frame and get the response.
@@ -114,7 +114,7 @@ async fn daemon_creates_and_lists_sessions() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "mytest").await;
@@ -141,7 +141,7 @@ async fn daemon_rejects_duplicate_name() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "dupname").await;
@@ -170,7 +170,7 @@ async fn daemon_allows_multiple_unnamed_sessions() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Create two unnamed sessions (empty name)
@@ -198,7 +198,7 @@ async fn daemon_kills_session() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "killme").await;
@@ -232,7 +232,7 @@ async fn daemon_kills_session_by_name() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let _id = create_session(&ctl_path, "named-kill").await;
@@ -266,7 +266,7 @@ async fn daemon_kills_server() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let _id = create_session(&ctl_path, "doomed").await;
@@ -287,7 +287,7 @@ async fn create_after_kill_same_name() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id1 = create_session(&ctl_path, "reuse").await;
@@ -336,7 +336,7 @@ async fn multiple_concurrent_sessions() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id1 = create_session(&ctl_path, "sess-a").await;
@@ -381,7 +381,7 @@ async fn daemon_unexpected_frame() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Send a Data frame (makes no sense on control socket)
@@ -417,7 +417,7 @@ async fn kill_server_no_sessions() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let resp = control_request(&ctl_path, Frame::KillServer).await;
@@ -439,7 +439,7 @@ async fn kill_nonexistent_session() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let resp = control_request(
@@ -464,7 +464,7 @@ async fn session_natural_exit_reaps_from_list() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let _id = create_session(&ctl_path, "reapme").await;
@@ -517,7 +517,7 @@ async fn list_before_session_ready() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Create session via NewSession (don't wait the usual 200ms from helper)
@@ -559,7 +559,7 @@ async fn kill_session_while_client_connected() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "kill-conn").await;
@@ -604,7 +604,7 @@ async fn session_metadata_has_pty_and_pid() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "metacheck").await;
@@ -642,7 +642,7 @@ async fn attach_to_session() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "attachme").await;
@@ -677,7 +677,7 @@ async fn attach_by_name() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "namedattach").await;
@@ -712,7 +712,7 @@ async fn attach_nonexistent_returns_error() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let resp = control_request(
@@ -739,7 +739,7 @@ async fn attach_dead_session_returns_error() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "dying").await;
@@ -795,7 +795,7 @@ async fn kill_dead_session_returns_error() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "dying2").await;
@@ -849,7 +849,7 @@ async fn list_sessions_shows_heartbeat() {
     let _ = std::fs::remove_file(&ctl_path);
 
     let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { ttyleport::daemon::run(&ctl).await });
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let id = create_session(&ctl_path, "hbtest").await;

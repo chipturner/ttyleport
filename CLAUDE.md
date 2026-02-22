@@ -2,17 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What is ttyleport
+## What is gritty
 
-ttyleport teleports a TTY over a Unix domain socket. Single binary, tmux-like CLI:
-- `ttyleport daemon` — starts the daemon in the foreground. Alias: `d`
-- `ttyleport new-session` — creates a persistent session and auto-attaches (requires running daemon). Alias: `new`
-- `ttyleport new-session -t <name>` — creates a named session and auto-attaches
-- `ttyleport attach -t <id|name>` — attaches to a session, detaches other clients. Alias: `a`
-- `ttyleport connect user@host` — SSH tunnel wrapper: auto-starts remote daemon, sets up tunnel, negotiates session. Alias: `c`
-- `ttyleport list-sessions` — lists active sessions with id/name/PTY/PID/status. Aliases: `ls`, `list`
-- `ttyleport kill-session -t <id|name>` — kills a specific session
-- `ttyleport kill-server` — kills daemon and all sessions
+gritty provides persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI:
+- `gritty daemon` — starts the daemon in the foreground. Alias: `d`
+- `gritty new-session` — creates a persistent session and auto-attaches (requires running daemon). Alias: `new`
+- `gritty new-session -t <name>` — creates a named session and auto-attaches
+- `gritty attach -t <id|name>` — attaches to a session, detaches other clients. Alias: `a`
+- `gritty connect user@host` — SSH tunnel wrapper: auto-starts remote daemon, sets up tunnel, negotiates session. Alias: `c`
+- `gritty list-sessions` — lists active sessions with id/name/PTY/PID/status. Aliases: `ls`, `list`
+- `gritty kill-session -t <id|name>` — kills a specific session
+- `gritty kill-server` — kills daemon and all sessions
 
 Sessions get auto-incrementing integer IDs (0, 1, 2...) with optional human-friendly names via `-t`.
 
@@ -51,11 +51,11 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 
 - **`protocol`** — `Frame` enum with session relay types (Data/Resize/Exit/Detached/Ping/Pong/Env), control request types (NewSession/Attach/ListSessions/KillSession/KillServer), and control response types (SessionCreated/SessionInfo/Ok/Error). `SessionEntry` struct carries per-session metadata (id, name, pty_path, shell_pid, created_at, attached, last_heartbeat). Custom tokio-util `Encoder`/`Decoder`. Wire format: `[type: u8][length: u32 BE][payload]`. Session relay: `0x01` Data, `0x02` Resize, `0x03` Exit, `0x04` Detached, `0x05` Ping, `0x06` Pong, `0x07` Env. Control requests: `0x10` NewSession, `0x11` Attach, `0x12` ListSessions, `0x13` KillSession, `0x14` KillServer. Control responses: `0x20` SessionCreated, `0x21` SessionInfo, `0x22` Ok, `0x23` Error.
 
-- **`daemon`** — Listens on a single socket (`$XDG_RUNTIME_DIR/ttyleport/ctl.sock` or `/tmp/ttyleport-$UID/ctl.sock`). Manages sessions in a `HashMap<u32, SessionState>` where `SessionState` holds `JoinHandle` + `Arc<OnceLock<SessionMetadata>>` + `mpsc::UnboundedSender` for client handoff + optional name. Auto-incrementing `next_id` counter. Session resolution: name match first, then numeric id parse. Handles `NewSession` (allocate id, create channel, spawn server, send SessionCreated, hand off framed connection), `Attach` (resolve session, send Ok, hand off), `ListSessions`, `KillSession`, `KillServer`. Reaps finished sessions before each operation.
+- **`daemon`** — Listens on a single socket (`$XDG_RUNTIME_DIR/gritty/ctl.sock` or `/tmp/gritty-$UID/ctl.sock`). Manages sessions in a `HashMap<u32, SessionState>` where `SessionState` holds `JoinHandle` + `Arc<OnceLock<SessionMetadata>>` + `mpsc::UnboundedSender` for client handoff + optional name. Auto-incrementing `next_id` counter. Session resolution: name match first, then numeric id parse. Handles `NewSession` (allocate id, create channel, spawn server, send SessionCreated, hand off framed connection), `Attach` (resolve session, send Ok, hand off), `ListSessions`, `KillSession`, `KillServer`. Reaps finished sessions before each operation.
 
 - **`server`** — `SessionMetadata` struct with pty_path, shell_pid, created_at, `AtomicBool` attached flag, `AtomicU64` last_heartbeat. `ManagedChild` wraps `tokio::process::Child` with process-group cleanup (`killpg(SIGHUP)` on drop). `run()` takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Deferred shell spawn: allocates PTY early, waits for first client, reads optional `Env` frame (100ms timeout), then spawns login shell (`-l`) with `CWD=$HOME` and forwarded env vars. Receives clients via channel (no per-session socket). Inner relay select includes `client_rx.recv()` for client takeover — new client gets the session, old client receives `Detached` frame. Replies `Pong` to `Ping` and updates `last_heartbeat` timestamp.
 
-- **`connect`** — SSH tunnel wrapper for remote access. `Destination` struct parses `[user@]host[:port]`. `remote_exec` runs commands on the remote host via SSH. `tunnel_command` builds hardened SSH tunnel commands (ServerAliveInterval, StreamLocalBindUnlink, ExitOnForwardFailure, ConnectTimeout, -N -T). `spawn_tunnel` + `wait_for_socket` (200ms poll, 15s timeout). `tunnel_monitor` background task watches the SSH child and respawns on transient failure (exit 255 = retry; rate limit 5 exits in 10s). `ensure_remote_ready` gets remote socket path and conditionally starts daemon. `negotiate_session` implements attach-or-create: try Attach first, fall back to NewSession on "no such session". `ConnectGuard` (Drop) kills SSH child and removes local socket. `run()` orchestrates: parse destination → ensure remote ready → spawn tunnel → wait for socket → negotiate session → spawn monitor → `client::run()` → cleanup. Local socket at `$XDG_RUNTIME_DIR/ttyleport/connect-{pid}.sock` (or `/tmp` fallback). 14 unit tests.
+- **`connect`** — SSH tunnel wrapper for remote access. `Destination` struct parses `[user@]host[:port]`. `remote_exec` runs commands on the remote host via SSH. `tunnel_command` builds hardened SSH tunnel commands (ServerAliveInterval, StreamLocalBindUnlink, ExitOnForwardFailure, ConnectTimeout, -N -T). `spawn_tunnel` + `wait_for_socket` (200ms poll, 15s timeout). `tunnel_monitor` background task watches the SSH child and respawns on transient failure (exit 255 = retry; rate limit 5 exits in 10s). `ensure_remote_ready` gets remote socket path and conditionally starts daemon. `negotiate_session` implements attach-or-create: try Attach first, fall back to NewSession on "no such session". `ConnectGuard` (Drop) kills SSH child and removes local socket. `run()` orchestrates: parse destination → ensure remote ready → spawn tunnel → wait for socket → negotiate session → spawn monitor → `client::run()` → cleanup. Local socket at `$XDG_RUNTIME_DIR/gritty/connect-{pid}.sock` (or `/tmp` fallback). 14 unit tests.
 
 - **`client`** — `NonBlockGuard` saves/restores stdin's `O_NONBLOCK` flag on drop (prevents breaking parent shell). `RawModeGuard` saves/restores terminal mode. `EscapeProcessor` implements SSH-style `~` escape sequences (detach/suspend/help). `run()` takes session id/name, initial framed connection, redraw flag, `ctl_path` for reconnect, `env_vars: Vec<(String, String)>`, and `no_escape: bool`. On first relay, sends `Env` frame (if non-empty) then `Resize`; on reconnect sends only `Resize` (env_vars cleared). Sends `Ping` every 5s; if no `Pong` within 15s, treats connection as dead. On disconnect/timeout, auto-reconnects via `ctl_path` (connect → Attach → resume relay). Prints `[reconnecting...]` / `[reconnected]` during the loop. Ctrl-C (0x03 in raw mode) exits during reconnect. Handles `Detached` frame with `[detached]` message (no reconnect on detach).
 
@@ -71,7 +71,7 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 - **Client takeover**: Inner relay loop also selects on `client_rx.recv()`. New client causes `Detached` to be sent to old client, then relay switches to new connection.
 - **Process group cleanup**: `ManagedChild` drop sends `SIGHUP` to shell's process group via `killpg`.
 - **Terminal state guards**: `RawModeGuard` restores terminal attrs, `NonBlockGuard` restores stdin flags. Drop order ensures `NonBlockGuard` outlives `AsyncFd`.
-- **Explicit daemon**: Daemon must be started explicitly via `ttyleport daemon`. `new-session` connects to the running daemon and fails clearly if none is running.
+- **Explicit daemon**: Daemon must be started explicitly via `gritty daemon`. `new-session` connects to the running daemon and fails clearly if none is running.
 - **Auto-attach**: After `NewSession` succeeds, the same connection transitions to session relay mode (client calls `client::run` with the existing framed connection).
 - **SIGWINCH on resize**: Server sends `killpg(SIGWINCH)` via `tcgetpgrp()` (foreground process group, not shell pgid) after every `TIOCSWINSZ`, ensuring foreground apps redraw on attach even when terminal size hasn't changed.
 - **Ctrl-L redraw on attach**: Client sends `\x0c` after initial resize to force shell/app redraw. Controlled by `redraw: bool` param to `client::run()`, disabled with `--no-redraw` CLI flag on attach.
@@ -85,7 +85,7 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). SSH tunnel wrapper (`ttyleport connect user@host`) for one-command remote access. All modules implemented and tested (109 tests: 17 escape processor + 14 connect + 39 protocol codec + 18 e2e session + 21 daemon integration).
+Full CLI with tmux-like ergonomics. Single-socket architecture. Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). SSH tunnel wrapper (`gritty connect user@host`) for one-command remote access. All modules implemented and tested (109 tests: 17 escape processor + 14 connect + 39 protocol codec + 18 e2e session + 21 daemon integration).
 
 ## Development Notes
 
