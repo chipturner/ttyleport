@@ -57,8 +57,9 @@ gritty kill-server
 `gritty ls` output:
 
 ```
-0: work /dev/pts/4 (pid 48291) (attached, heartbeat 3s ago)
-1: logs /dev/pts/5 (pid 48305) (detached)
+ID  Name  PTY         PID    Created              Status
+0   work  /dev/pts/4  48291  2026-02-21 14:32:07  attached (heartbeat 3s ago)
+1   logs  /dev/pts/5  48305  2026-02-21 14:33:41  detached
 ```
 
 ## Remote Usage via SSH

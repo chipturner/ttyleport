@@ -325,27 +325,61 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                for s in &sessions {
-                    let status = if s.attached {
-                        if s.last_heartbeat > 0 {
-                            let ago = now.saturating_sub(s.last_heartbeat);
-                            format!("attached, heartbeat {ago}s ago")
+
+                // Build row data
+                let rows: Vec<_> = sessions
+                    .iter()
+                    .map(|s| {
+                        let name = if s.name.is_empty() {
+                            "-".to_string()
                         } else {
-                            "attached".to_string()
-                        }
-                    } else {
-                        "detached".to_string()
-                    };
-                    let label = if s.name.is_empty() {
-                        s.id.clone()
-                    } else {
-                        format!("{}: {}", s.id, s.name)
-                    };
-                    if s.shell_pid > 0 {
-                        println!("{label} {} (pid {}) ({status})", s.pty_path, s.shell_pid);
-                    } else {
-                        println!("{label} (starting...)");
-                    }
+                            s.name.clone()
+                        };
+                        let (pty, pid, created, status) = if s.shell_pid == 0 {
+                            (
+                                "-".to_string(),
+                                "-".to_string(),
+                                "-".to_string(),
+                                "starting".to_string(),
+                            )
+                        } else {
+                            let status = if s.attached {
+                                if s.last_heartbeat > 0 {
+                                    let ago = now.saturating_sub(s.last_heartbeat);
+                                    format!("attached (heartbeat {ago}s ago)")
+                                } else {
+                                    "attached".to_string()
+                                }
+                            } else {
+                                "detached".to_string()
+                            };
+                            (
+                                s.pty_path.clone(),
+                                s.shell_pid.to_string(),
+                                format_timestamp(s.created_at),
+                                status,
+                            )
+                        };
+                        (s.id.clone(), name, pty, pid, created, status)
+                    })
+                    .collect();
+
+                // Compute column widths
+                let w_id = rows.iter().map(|r| r.0.len()).max().unwrap().max(2);
+                let w_name = rows.iter().map(|r| r.1.len()).max().unwrap().max(4);
+                let w_pty = rows.iter().map(|r| r.2.len()).max().unwrap().max(3);
+                let w_pid = rows.iter().map(|r| r.3.len()).max().unwrap().max(3);
+                let w_created = rows.iter().map(|r| r.4.len()).max().unwrap().max(7);
+
+                println!(
+                    "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  Status",
+                    "ID", "Name", "PTY", "PID", "Created",
+                );
+                for (id, name, pty, pid, created, status) in &rows {
+                    println!(
+                        "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  {status}",
+                        id, name, pty, pid, created,
+                    );
                 }
             }
             Ok(())
@@ -354,6 +388,24 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
             anyhow::bail!("unexpected response from daemon: {other:?}");
         }
     }
+}
+
+fn format_timestamp(epoch_secs: u64) -> String {
+    let time = epoch_secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::localtime_r(&time, &mut tm) };
+    if result.is_null() {
+        return "-".to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )
 }
 
 async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
