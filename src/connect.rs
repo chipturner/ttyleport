@@ -1,12 +1,8 @@
-use crate::protocol::{Frame, FrameCodec};
 use anyhow::{bail, Context};
-use futures_util::{SinkExt, StreamExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -249,7 +245,7 @@ async fn tunnel_monitor(
 const REMOTE_ENSURE_CMD: &str = "\
     SOCK=$(gritty socket-path) && \
     (gritty ls >/dev/null 2>&1 || \
-     { nohup gritty daemon </dev/null >/dev/null 2>&1 & sleep 0.5; }) && \
+     { gritty daemon && sleep 0.3; }) && \
     echo \"$SOCK\"";
 
 /// Get the remote socket path and optionally auto-start the daemon.
@@ -284,73 +280,6 @@ fn local_socket_path() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Session negotiation
-// ---------------------------------------------------------------------------
-
-/// Connect through the local socket, try Attach then NewSession.
-/// Returns (session_label, framed_connection, env_vars).
-async fn negotiate_session(
-    local_sock: &Path,
-    target: Option<&str>,
-    force_new: bool,
-) -> anyhow::Result<(String, Framed<UnixStream, FrameCodec>, Vec<(String, String)>)> {
-    let env_vars = crate::collect_env_vars();
-
-    let session_name = target.unwrap_or_default().to_string();
-
-    // If we have a target and aren't forcing new, try attach first
-    if target.is_some() && !force_new {
-        let stream = UnixStream::connect(local_sock)
-            .await
-            .context("failed to connect to tunnel socket")?;
-        let mut framed = Framed::new(stream, FrameCodec);
-
-        framed
-            .send(Frame::Attach {
-                session: session_name.clone(),
-            })
-            .await?;
-
-        match Frame::expect_from(framed.next().await)? {
-            Frame::Ok => {
-                eprintln!("[attached]");
-                return Ok((session_name, framed, vec![]));
-            }
-            Frame::Error { message } if message.contains("no such session") => {
-                debug!("session not found, will create");
-            }
-            Frame::Error { message } => bail!("{message}"),
-            other => bail!("unexpected response: {other:?}"),
-        }
-    }
-
-    // Create new session
-    let stream = UnixStream::connect(local_sock)
-        .await
-        .context("failed to connect to tunnel socket")?;
-    let mut framed = Framed::new(stream, FrameCodec);
-
-    framed
-        .send(Frame::NewSession {
-            name: session_name.clone(),
-        })
-        .await?;
-
-    match Frame::expect_from(framed.next().await)? {
-        Frame::SessionCreated { id } => {
-            if session_name.is_empty() {
-                eprintln!("session created: id {id}");
-            } else {
-                eprintln!("session created: {session_name} (id {id})");
-            }
-            Ok((id, framed, env_vars))
-        }
-        Frame::Error { message } => bail!("{message}"),
-        other => bail!("unexpected response: {other:?}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Cleanup guard
 // ---------------------------------------------------------------------------
 
@@ -382,24 +311,12 @@ impl Drop for ConnectGuard {
 
 pub struct ConnectOpts {
     pub destination: String,
-    pub target: Option<String>,
-    pub force_new: bool,
-    pub list: bool,
-    pub no_redraw: bool,
-    pub no_escape: bool,
     pub no_daemon_start: bool,
     pub ssh_options: Vec<String>,
 }
 
 pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     let dest = Destination::parse(&opts.destination)?;
-
-    // --ls: list remote sessions and exit
-    if opts.list {
-        let output = remote_exec(&dest, "gritty ls", &opts.ssh_options).await?;
-        println!("{output}");
-        return Ok(0);
-    }
 
     // 1. Ensure remote daemon is running and get socket path
     eprintln!("starting remote daemon...");
@@ -427,13 +344,9 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     // 4. Wait for local socket to become connectable
     wait_for_socket(&local_sock).await?;
 
-    // 5. Negotiate session (attach-or-create)
-    let (session_label, framed, env_vars) =
-        negotiate_session(&local_sock, opts.target.as_deref(), opts.force_new).await?;
-
-    // 6. Hand off the child to the tunnel monitor background task
+    // 5. Hand off the child to the tunnel monitor background task
     let original_child = guard.child.take().unwrap();
-    tokio::spawn(tunnel_monitor(
+    let monitor_handle = tokio::spawn(tunnel_monitor(
         original_child,
         dest,
         local_sock.clone(),
@@ -442,21 +355,26 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
         stop.clone(),
     ));
 
-    // 7. Run the client relay (reuses existing client::run with auto-reconnect)
-    let code = crate::client::run(
-        &session_label,
-        framed,
-        !opts.no_redraw,
-        &local_sock,
-        env_vars,
-        opts.no_escape,
-    )
-    .await?;
+    // 6. Print socket path and usage hints
+    println!("{}", local_sock.display());
+    eprintln!("tunnel ready. to use:");
+    eprintln!("  gritty new --ctl-socket {}", local_sock.display());
+    eprintln!("  gritty attach -t <name> --ctl-socket {}", local_sock.display());
+
+    // 7. Wait for signal or monitor death
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+        _ = monitor_handle => {
+            eprintln!("tunnel lost");
+        }
+    }
 
     // 8. Cleanup (guard Drop handles ssh kill + socket removal)
     drop(guard);
 
-    Ok(code)
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

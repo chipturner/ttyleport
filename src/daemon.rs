@@ -2,6 +2,7 @@ use crate::protocol::{Frame, FrameCodec, SessionEntry};
 use crate::server::{self, SessionMetadata};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -32,6 +33,11 @@ pub fn socket_dir() -> PathBuf {
 /// Returns the daemon socket path.
 pub fn control_socket_path() -> PathBuf {
     socket_dir().join("ctl.sock")
+}
+
+/// Returns the PID file path (sibling to ctl.sock).
+fn pid_file_path(ctl_path: &Path) -> PathBuf {
+    ctl_path.with_file_name("daemon.pid")
 }
 
 fn reap_sessions(sessions: &mut HashMap<u32, SessionState>) {
@@ -93,8 +99,21 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
     entries
 }
 
+fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
+    for (id, state) in sessions.drain() {
+        state.handle.abort();
+        info!(id, "session aborted");
+    }
+    let _ = std::fs::remove_file(ctl_path);
+    let _ = std::fs::remove_file(pid_file_path(ctl_path));
+}
+
 /// Run the daemon, listening on its socket.
-pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
+///
+/// If `ready_fd` is provided, a single byte is written to it after the socket
+/// is bound, then the fd is dropped. This unblocks the parent process after
+/// `daemonize()` forks.
+pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<()> {
     // Restrictive umask for all files/sockets created by the daemon
     unsafe {
         libc::umask(0o077);
@@ -108,13 +127,45 @@ pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
     let listener = crate::security::bind_unix_listener(ctl_path)?;
     info!(path = %ctl_path.display(), "daemon listening");
 
+    // Signal readiness to parent (daemonize pipe)
+    if let Some(fd) = ready_fd {
+        use std::io::Write;
+        let mut f = std::fs::File::from(fd);
+        let _ = f.write_all(&[1]);
+        // f drops here, closing the pipe
+    }
+
+    // Write PID file
+    let pid_path = pid_file_path(ctl_path);
+    std::fs::write(&pid_path, std::process::id().to_string())?;
+
     let mut sessions: HashMap<u32, SessionState> = HashMap::new();
     let mut next_id: u32 = 0;
+
+    // Signal handlers
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     loop {
         reap_sessions(&mut sessions);
 
-        let (stream, _addr) = listener.accept().await?;
+        let stream = tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result?;
+                stream
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, shutting down");
+                shutdown(&mut sessions, ctl_path);
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("SIGINT received, shutting down");
+                shutdown(&mut sessions, ctl_path);
+                break;
+            }
+        };
+
         if let Err(e) = crate::security::verify_peer_uid(&stream) {
             warn!("{e}");
             continue;
@@ -216,12 +267,8 @@ pub async fn run(ctl_path: &Path) -> anyhow::Result<()> {
             }
             Frame::KillServer => {
                 info!("kill-server received, shutting down");
-                for (id, state) in sessions.drain() {
-                    state.handle.abort();
-                    info!(id, "session aborted");
-                }
+                shutdown(&mut sessions, ctl_path);
                 let _ = framed.send(Frame::Ok).await;
-                let _ = std::fs::remove_file(ctl_path);
                 break;
             }
             other => {

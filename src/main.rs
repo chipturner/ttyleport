@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -15,9 +16,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the daemon (runs in foreground)
+    /// Start the daemon (backgrounds by default, use --foreground to stay in foreground)
     #[command(alias = "d")]
-    Daemon,
+    Daemon {
+        /// Run in the foreground instead of daemonizing
+        #[arg(long, short = 'f')]
+        foreground: bool,
+    },
     /// Create a new persistent session (auto-attaches)
     #[command(alias = "new")]
     NewSession {
@@ -58,35 +63,15 @@ enum Command {
     /// Print the default socket path
     #[command(alias = "socket")]
     SocketPath,
-    /// Connect to a remote host via SSH tunnel
+    /// SSH tunnel to a remote host (prints socket path, stays running)
     #[command(alias = "c")]
     Connect {
         /// Remote destination ([user@]host[:port])
         destination: String,
 
-        /// Session name (attaches if exists, creates if not)
-        #[arg(short = 't', long = "target")]
-        target: Option<String>,
-
-        /// Force create a new session (error if name already taken)
-        #[arg(long)]
-        new: bool,
-
-        /// List remote sessions and exit
-        #[arg(long)]
-        ls: bool,
-
         /// Don't auto-start remote daemon
         #[arg(long)]
         no_daemon_start: bool,
-
-        /// Don't send Ctrl-L to redraw after attaching
-        #[arg(long)]
-        no_redraw: bool,
-
-        /// Disable escape sequences (~. detach, ~? help, etc.)
-        #[arg(long)]
-        no_escape: bool,
 
         /// Extra SSH options (can be repeated)
         #[arg(long = "ssh-option", short = 'o')]
@@ -94,26 +79,127 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
+}
 
-    if let Err(e) = run().await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+/// Fork into background, returning the write end of the readiness pipe.
+///
+/// Parent: blocks reading the pipe. Gets a byte → child is ready (prints PID, exits 0).
+/// Gets EOF → child died (exits 1).
+/// Child: returns Ok(OwnedFd) for the write end of the pipe.
+fn daemonize() -> anyhow::Result<OwnedFd> {
+    use nix::unistd::{ForkResult, dup2, fork, pipe, setsid};
+    let (read_fd, write_fd) = pipe()?;
+
+    // Safety: fork before any threads (tokio runtime not yet created)
+    match unsafe { fork() }? {
+        ForkResult::Parent { child } => {
+            // Close write end
+            drop(write_fd);
+
+            // Read from pipe: one byte = child ready, EOF = child died
+            let mut buf = [0u8; 1];
+            let mut read_file = std::fs::File::from(read_fd);
+            use std::io::Read;
+            match read_file.read(&mut buf) {
+                Ok(1) => {
+                    eprintln!("daemon started (pid {child})");
+                    std::process::exit(0);
+                }
+                _ => {
+                    eprintln!("error: daemon failed to start");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ForkResult::Child => {
+            // Close read end
+            drop(read_fd);
+
+            // New session, detach from terminal
+            setsid()?;
+
+            // Redirect stdin/stdout/stderr to /dev/null
+            let devnull = nix::fcntl::open(
+                "/dev/null",
+                nix::fcntl::OFlag::O_RDWR,
+                nix::sys::stat::Mode::empty(),
+            )?;
+            dup2(devnull, 0)?;
+            dup2(devnull, 1)?;
+            dup2(devnull, 2)?;
+            if devnull > 2 {
+                nix::unistd::close(devnull)?;
+            }
+
+            Ok(write_fd)
+        }
     }
 }
 
-async fn run() -> anyhow::Result<()> {
+fn main() {
     let cli = Cli::parse();
+
+    match cli.command {
+        Command::Daemon { foreground } => {
+            let ctl_path = cli
+                .ctl_socket
+                .unwrap_or_else(gritty::daemon::control_socket_path);
+
+            let ready_fd = if foreground {
+                None
+            } else {
+                match daemonize() {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        eprintln!("error: failed to daemonize: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            };
+
+            // Init tracing AFTER fork (stderr may be /dev/null in daemon mode)
+            init_tracing();
+
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = rt.block_on(gritty::daemon::run(&ctl_path, ready_fd)) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        _ => {
+            init_tracing();
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = rt.block_on(run(cli)) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
     let ctl_path = cli
         .ctl_socket
         .unwrap_or_else(gritty::daemon::control_socket_path);
     match cli.command {
-        Command::Daemon => gritty::daemon::run(&ctl_path).await,
+        Command::Daemon { .. } => unreachable!(),
         Command::NewSession { target, no_escape } => new_session(target, no_escape, ctl_path).await,
         Command::Attach { target, no_redraw, no_escape } => {
             let code = attach(target, !no_redraw, no_escape, ctl_path).await?;
@@ -128,21 +214,11 @@ async fn run() -> anyhow::Result<()> {
         }
         Command::Connect {
             destination,
-            target,
-            new,
-            ls,
             no_daemon_start,
-            no_redraw,
-            no_escape,
             ssh_options,
         } => {
             let code = gritty::connect::run(gritty::connect::ConnectOpts {
                 destination,
-                target,
-                force_new: new,
-                list: ls,
-                no_redraw,
-                no_escape,
                 no_daemon_start,
                 ssh_options,
             })
