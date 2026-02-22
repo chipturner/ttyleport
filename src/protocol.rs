@@ -77,7 +77,34 @@ pub enum Frame {
     },
 }
 
+impl Frame {
+    /// Extract a Frame from a `framed.next().await` result, converting
+    /// the common None / Some(Err) cases into descriptive errors.
+    pub fn expect_from(result: Option<Result<Frame, io::Error>>) -> anyhow::Result<Frame> {
+        match result {
+            Some(Ok(frame)) => Ok(frame),
+            Some(Err(e)) => Err(anyhow::anyhow!("daemon protocol error: {e}")),
+            None => Err(anyhow::anyhow!("daemon closed connection")),
+        }
+    }
+}
+
 pub struct FrameCodec;
+
+fn encode_empty(dst: &mut BytesMut, ty: u8) {
+    dst.put_u8(ty);
+    dst.put_u32(0);
+}
+
+fn encode_str(dst: &mut BytesMut, ty: u8, s: &str) {
+    dst.put_u8(ty);
+    dst.put_u32(s.len() as u32);
+    dst.extend_from_slice(s.as_bytes());
+}
+
+fn decode_string(payload: BytesMut) -> Result<String, io::Error> {
+    String::from_utf8(payload.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
 
 impl Decoder for FrameCodec {
     type Item = Frame;
@@ -147,28 +174,12 @@ impl Decoder for FrameCodec {
                 };
                 Ok(Some(Frame::Env { vars }))
             }
-            TYPE_NEW_SESSION => {
-                let name = String::from_utf8(payload.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(Frame::NewSession { name }))
-            }
-            TYPE_ATTACH => {
-                let session = String::from_utf8(payload.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(Frame::Attach { session }))
-            }
+            TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
+            TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
             TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
-            TYPE_KILL_SESSION => {
-                let session = String::from_utf8(payload.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(Frame::KillSession { session }))
-            }
+            TYPE_KILL_SESSION => Ok(Some(Frame::KillSession { session: decode_string(payload)? })),
             TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
-            TYPE_SESSION_CREATED => {
-                let id = String::from_utf8(payload.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(Frame::SessionCreated { id }))
-            }
+            TYPE_SESSION_CREATED => Ok(Some(Frame::SessionCreated { id: decode_string(payload)? })),
             TYPE_SESSION_INFO => {
                 let text = String::from_utf8(payload.to_vec())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -197,11 +208,7 @@ impl Decoder for FrameCodec {
                 Ok(Some(Frame::SessionInfo { sessions }))
             }
             TYPE_OK => Ok(Some(Frame::Ok)),
-            TYPE_ERROR => {
-                let message = String::from_utf8(payload.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(Frame::Error { message }))
-            }
+            TYPE_ERROR => Ok(Some(Frame::Error { message: decode_string(payload)? })),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown frame type: 0x{frame_type:02x}"),
@@ -231,18 +238,9 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u32(4);
                 dst.put_i32(code);
             }
-            Frame::Detached => {
-                dst.put_u8(TYPE_DETACHED);
-                dst.put_u32(0);
-            }
-            Frame::Ping => {
-                dst.put_u8(TYPE_PING);
-                dst.put_u32(0);
-            }
-            Frame::Pong => {
-                dst.put_u8(TYPE_PONG);
-                dst.put_u32(0);
-            }
+            Frame::Detached => encode_empty(dst, TYPE_DETACHED),
+            Frame::Ping => encode_empty(dst, TYPE_PING),
+            Frame::Pong => encode_empty(dst, TYPE_PONG),
             Frame::Env { vars } => {
                 let text: String = vars
                     .iter()
@@ -253,34 +251,12 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u32(text.len() as u32);
                 dst.extend_from_slice(text.as_bytes());
             }
-            Frame::NewSession { name } => {
-                dst.put_u8(TYPE_NEW_SESSION);
-                dst.put_u32(name.len() as u32);
-                dst.extend_from_slice(name.as_bytes());
-            }
-            Frame::Attach { session } => {
-                dst.put_u8(TYPE_ATTACH);
-                dst.put_u32(session.len() as u32);
-                dst.extend_from_slice(session.as_bytes());
-            }
-            Frame::ListSessions => {
-                dst.put_u8(TYPE_LIST_SESSIONS);
-                dst.put_u32(0);
-            }
-            Frame::KillSession { session } => {
-                dst.put_u8(TYPE_KILL_SESSION);
-                dst.put_u32(session.len() as u32);
-                dst.extend_from_slice(session.as_bytes());
-            }
-            Frame::KillServer => {
-                dst.put_u8(TYPE_KILL_SERVER);
-                dst.put_u32(0);
-            }
-            Frame::SessionCreated { id } => {
-                dst.put_u8(TYPE_SESSION_CREATED);
-                dst.put_u32(id.len() as u32);
-                dst.extend_from_slice(id.as_bytes());
-            }
+            Frame::NewSession { name } => encode_str(dst, TYPE_NEW_SESSION, &name),
+            Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),
+            Frame::ListSessions => encode_empty(dst, TYPE_LIST_SESSIONS),
+            Frame::KillSession { session } => encode_str(dst, TYPE_KILL_SESSION, &session),
+            Frame::KillServer => encode_empty(dst, TYPE_KILL_SERVER),
+            Frame::SessionCreated { id } => encode_str(dst, TYPE_SESSION_CREATED, &id),
             Frame::SessionInfo { sessions } => {
                 let text: String = sessions
                     .iter()
@@ -302,15 +278,8 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u32(text.len() as u32);
                 dst.extend_from_slice(text.as_bytes());
             }
-            Frame::Ok => {
-                dst.put_u8(TYPE_OK);
-                dst.put_u32(0);
-            }
-            Frame::Error { message } => {
-                dst.put_u8(TYPE_ERROR);
-                dst.put_u32(message.len() as u32);
-                dst.extend_from_slice(message.as_bytes());
-            }
+            Frame::Ok => encode_empty(dst, TYPE_OK),
+            Frame::Error { message } => encode_str(dst, TYPE_ERROR, &message),
         }
         Ok(())
     }

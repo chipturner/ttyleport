@@ -170,23 +170,18 @@ async fn new_session(name: Option<String>, no_escape: bool, ctl_path: PathBuf) -
         })
         .await?;
 
-    match framed.next().await {
-        Some(Ok(Frame::SessionCreated { id })) => {
+    match Frame::expect_from(framed.next().await)? {
+        Frame::SessionCreated { id } => {
             match &name {
                 Some(n) => eprintln!("session created: {n} (id {id})"),
                 None => eprintln!("session created: id {id}"),
             }
-            let env_vars: Vec<(String, String)> = ["TERM", "LANG", "COLORTERM"]
-                .iter()
-                .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-                .collect();
+            let env_vars = ttyleport::collect_env_vars();
             let code = ttyleport::client::run(&id, framed, false, &ctl_path, env_vars, no_escape).await?;
             std::process::exit(code);
         }
-        Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
-        Some(Err(e)) => anyhow::bail!("daemon protocol error: {e}"),
-        None => anyhow::bail!("daemon closed connection (is it still running?)"),
-        Some(Ok(other)) => anyhow::bail!("unexpected response from daemon: {other:?}"),
+        Frame::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
     }
 }
 
@@ -212,16 +207,14 @@ async fn attach(target: String, redraw: bool, no_escape: bool, ctl_path: PathBuf
         })
         .await?;
 
-    match framed.next().await {
-        Some(Ok(Frame::Ok)) => {
+    match Frame::expect_from(framed.next().await)? {
+        Frame::Ok => {
             eprintln!("[attached]");
             let code = ttyleport::client::run(&target, framed, redraw, &ctl_path, vec![], no_escape).await?;
             Ok(code)
         }
-        Some(Ok(Frame::Error { message })) => anyhow::bail!("{message}"),
-        Some(Err(e)) => anyhow::bail!("daemon protocol error: {e}"),
-        None => anyhow::bail!("daemon closed connection (is it still running?)"),
-        Some(Ok(other)) => anyhow::bail!("unexpected response from daemon: {other:?}"),
+        Frame::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
     }
 }
 
@@ -233,18 +226,14 @@ async fn daemon_request(
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use ttyleport::protocol::FrameCodec;
+    use ttyleport::protocol::{Frame, FrameCodec};
 
     let stream = UnixStream::connect(ctl_path)
         .await
         .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display()))?;
     let mut framed = Framed::new(stream, FrameCodec);
     framed.send(frame).await?;
-    match framed.next().await {
-        Some(Ok(resp)) => Ok(resp),
-        Some(Err(e)) => Err(e.into()),
-        None => anyhow::bail!("daemon closed connection without response"),
-    }
+    Frame::expect_from(framed.next().await)
 }
 
 async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {

@@ -18,15 +18,20 @@ struct SessionState {
     name: Option<String>,
 }
 
-/// Returns the daemon socket path.
-/// Prefers $XDG_RUNTIME_DIR/ttyleport/ctl.sock, falls back to /tmp/ttyleport-$UID/ctl.sock.
-pub fn control_socket_path() -> PathBuf {
+/// Returns the base directory for ttyleport sockets.
+/// Prefers $XDG_RUNTIME_DIR/ttyleport, falls back to /tmp/ttyleport-$UID.
+pub fn socket_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("ttyleport").join("ctl.sock")
+        PathBuf::from(xdg).join("ttyleport")
     } else {
         let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/ttyleport-{uid}")).join("ctl.sock")
+        PathBuf::from(format!("/tmp/ttyleport-{uid}"))
     }
+}
+
+/// Returns the daemon socket path.
+pub fn control_socket_path() -> PathBuf {
+    socket_dir().join("ctl.sock")
 }
 
 fn reap_sessions(sessions: &mut HashMap<u32, SessionState>) {

@@ -280,13 +280,7 @@ async fn ensure_remote_ready(
 /// Compute a PID-based local socket path for the tunnel endpoint.
 fn local_socket_path() -> PathBuf {
     let pid = std::process::id();
-    let dir = if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("ttyleport")
-    } else {
-        let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/ttyleport-{uid}"))
-    };
-    dir.join(format!("connect-{pid}.sock"))
+    crate::daemon::socket_dir().join(format!("connect-{pid}.sock"))
 }
 
 // ---------------------------------------------------------------------------
@@ -300,10 +294,7 @@ async fn negotiate_session(
     target: Option<&str>,
     force_new: bool,
 ) -> anyhow::Result<(String, Framed<UnixStream, FrameCodec>, Vec<(String, String)>)> {
-    let env_vars: Vec<(String, String)> = ["TERM", "LANG", "COLORTERM"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
-        .collect();
+    let env_vars = crate::collect_env_vars();
 
     let session_name = target.unwrap_or_default().to_string();
 
@@ -320,21 +311,16 @@ async fn negotiate_session(
             })
             .await?;
 
-        match framed.next().await {
-            Some(Ok(Frame::Ok)) => {
+        match Frame::expect_from(framed.next().await)? {
+            Frame::Ok => {
                 eprintln!("[attached]");
                 return Ok((session_name, framed, vec![]));
             }
-            Some(Ok(Frame::Error { message }))
-                if message.contains("no such session") =>
-            {
-                // Fall through to create
+            Frame::Error { message } if message.contains("no such session") => {
                 debug!("session not found, will create");
             }
-            Some(Ok(Frame::Error { message })) => bail!("{message}"),
-            Some(Err(e)) => bail!("daemon protocol error: {e}"),
-            None => bail!("daemon closed connection"),
-            Some(Ok(other)) => bail!("unexpected response: {other:?}"),
+            Frame::Error { message } => bail!("{message}"),
+            other => bail!("unexpected response: {other:?}"),
         }
     }
 
@@ -350,8 +336,8 @@ async fn negotiate_session(
         })
         .await?;
 
-    match framed.next().await {
-        Some(Ok(Frame::SessionCreated { id })) => {
+    match Frame::expect_from(framed.next().await)? {
+        Frame::SessionCreated { id } => {
             if session_name.is_empty() {
                 eprintln!("session created: id {id}");
             } else {
@@ -359,10 +345,8 @@ async fn negotiate_session(
             }
             Ok((id, framed, env_vars))
         }
-        Some(Ok(Frame::Error { message })) => bail!("{message}"),
-        Some(Err(e)) => bail!("daemon protocol error: {e}"),
-        None => bail!("daemon closed connection"),
-        Some(Ok(other)) => bail!("unexpected response: {other:?}"),
+        Frame::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
     }
 }
 
