@@ -219,6 +219,7 @@ Early stage. Works on Linux. Not yet packaged for distribution.
 - **Daemon auto-start** — start the daemon on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** — daemon re-execs itself with a new binary, preserving sessions and child processes across upgrades
 - **Read-only attach** — multiple clients viewing the same session for pair programming or demos
+- **Better remote PATH resolution** — `connect` currently prepends common paths (`~/bin`, `~/.local/bin`, `~/.cargo/bin`) to find gritty on the remote host; needs a more robust solution (login shell invocation or user-configurable remote binary path)
 
 ## License
 

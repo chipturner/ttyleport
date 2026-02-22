@@ -86,6 +86,14 @@ async fn remote_exec(
     remote_cmd: &str,
     extra_ssh_opts: &[String],
 ) -> anyhow::Result<String> {
+    // Prepend common binary paths — SSH non-interactive shells don't source
+    // .bashrc/.zshrc, so ~/bin etc. won't be in PATH by default.
+    let wrapped_cmd = format!(
+        "PATH=\"$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {remote_cmd}"
+    );
+
+    debug!("ssh {}: {remote_cmd}", dest.ssh_dest());
+
     let mut cmd = Command::new("ssh");
     cmd.args(dest.port_args());
     for opt in extra_ssh_opts {
@@ -93,7 +101,7 @@ async fn remote_exec(
     }
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg(dest.ssh_dest());
-    cmd.arg(remote_cmd);
+    cmd.arg(&wrapped_cmd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -103,13 +111,16 @@ async fn remote_exec(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
+        debug!("ssh failed (status {}): {stderr}", output.status);
         if stderr.contains("command not found") || stderr.contains("No such file") {
             bail!("gritty not found on remote host (is it in PATH?)");
         }
         bail!("ssh command failed: {stderr}");
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    debug!("ssh output: {stdout}");
+    Ok(stdout)
 }
 
 /// Build the SSH tunnel command with hardened options.
@@ -145,9 +156,15 @@ async fn spawn_tunnel(
     remote_sock: &str,
     extra_ssh_opts: &[String],
 ) -> anyhow::Result<Child> {
+    debug!(
+        "tunnel: {} -> {}:{}",
+        local_sock.display(),
+        dest.ssh_dest(),
+        remote_sock,
+    );
     let mut cmd = tunnel_command(dest, local_sock, remote_sock, extra_ssh_opts);
     let child = cmd.spawn().context("failed to spawn ssh tunnel")?;
-    debug!("ssh tunnel spawned (pid {:?})", child.id());
+    debug!("ssh tunnel pid: {:?}", child.id());
     Ok(child)
 }
 
@@ -259,6 +276,7 @@ async fn ensure_remote_ready(
     } else {
         REMOTE_ENSURE_CMD
     };
+    debug!("ensuring remote daemon (no_daemon_start={no_daemon_start})");
 
     let sock_path = remote_exec(dest, remote_cmd, extra_ssh_opts).await?;
 
@@ -325,6 +343,7 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
 
     // 2. Compute local socket path
     let local_sock = local_socket_path();
+    debug!("local socket: {}", local_sock.display());
     if let Some(parent) = local_sock.parent() {
         crate::security::secure_create_dir_all(parent)?;
     }
@@ -343,6 +362,7 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
 
     // 4. Wait for local socket to become connectable
     wait_for_socket(&local_sock).await?;
+    debug!("tunnel socket ready");
 
     // 5. Hand off the child to the tunnel monitor background task
     let original_child = guard.child.take().unwrap();

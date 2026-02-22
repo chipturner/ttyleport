@@ -10,6 +10,10 @@ struct Cli {
     #[arg(long, global = true)]
     ctl_socket: Option<PathBuf>,
 
+    /// Enable verbose logging
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -79,9 +83,14 @@ enum Command {
     },
 }
 
-fn init_tracing() {
+fn init_tracing(verbose: bool) {
+    let filter = if verbose && std::env::var("RUST_LOG").is_err() {
+        EnvFilter::new("gritty=debug")
+    } else {
+        EnvFilter::from_default_env()
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 }
@@ -143,6 +152,7 @@ fn daemonize() -> anyhow::Result<OwnedFd> {
 
 fn main() {
     let cli = Cli::parse();
+    let verbose = cli.verbose;
 
     match cli.command {
         Command::Daemon { foreground } => {
@@ -163,7 +173,7 @@ fn main() {
             };
 
             // Init tracing AFTER fork (stderr may be /dev/null in daemon mode)
-            init_tracing();
+            init_tracing(verbose);
 
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -178,7 +188,7 @@ fn main() {
             }
         }
         _ => {
-            init_tracing();
+            init_tracing(verbose);
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
