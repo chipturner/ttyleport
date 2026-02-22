@@ -30,7 +30,7 @@ enum Command {
         no_escape: bool,
     },
     /// Attach to an existing session (detaches other clients)
-    #[command(alias = "a", alias = "connect")]
+    #[command(alias = "a")]
     Attach {
         /// Session id or name
         #[arg(short = 't', long = "target")]
@@ -58,6 +58,40 @@ enum Command {
     /// Print the default socket path
     #[command(alias = "socket")]
     SocketPath,
+    /// Connect to a remote host via SSH tunnel
+    #[command(alias = "c")]
+    Connect {
+        /// Remote destination ([user@]host[:port])
+        destination: String,
+
+        /// Session name (attaches if exists, creates if not)
+        #[arg(short = 't', long = "target")]
+        target: Option<String>,
+
+        /// Force create a new session (error if name already taken)
+        #[arg(long)]
+        new: bool,
+
+        /// List remote sessions and exit
+        #[arg(long)]
+        ls: bool,
+
+        /// Don't auto-start remote daemon
+        #[arg(long)]
+        no_daemon_start: bool,
+
+        /// Don't send Ctrl-L to redraw after attaching
+        #[arg(long)]
+        no_redraw: bool,
+
+        /// Disable escape sequences (~. detach, ~? help, etc.)
+        #[arg(long)]
+        no_escape: bool,
+
+        /// Extra SSH options (can be repeated)
+        #[arg(long = "ssh-option", short = 'o')]
+        ssh_options: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -91,6 +125,29 @@ async fn run() -> anyhow::Result<()> {
         Command::SocketPath => {
             println!("{}", ctl_path.display());
             Ok(())
+        }
+        Command::Connect {
+            destination,
+            target,
+            new,
+            ls,
+            no_daemon_start,
+            no_redraw,
+            no_escape,
+            ssh_options,
+        } => {
+            let code = ttyleport::connect::run(ttyleport::connect::ConnectOpts {
+                destination,
+                target,
+                force_new: new,
+                list: ls,
+                no_redraw,
+                no_escape,
+                no_daemon_start,
+                ssh_options,
+            })
+            .await?;
+            std::process::exit(code);
         }
     }
 }

@@ -42,46 +42,44 @@ ttyleport kill-server
 
 ## Remote usage via SSH
 
-The real value of ttyleport is remote sessions that survive network interruptions.
-
-**On the remote host**, start the daemon:
+The real value of ttyleport is remote sessions that survive network interruptions. One command handles everything — SSH tunnel setup, remote daemon start, session negotiation, and relay:
 
 ```bash
+# Connect to remote host, create or reattach to a named session
+ttyleport connect user@remote-host -t project
+
+# List remote sessions
+ttyleport connect user@remote-host --ls
+
+# Force create a new session (error if name exists)
+ttyleport connect user@remote-host -t project --new
+
+# Custom SSH port
+ttyleport connect user@remote-host:2222 -t project
+
+# Pass extra SSH options
+ttyleport connect user@remote-host -t project -o "ProxyJump=bastion"
+```
+
+Close your laptop, switch networks, lose your SSH tunnel — ttyleport detects the dead connection, respawns the tunnel, and auto-reconnects. Use `~.` to detach cleanly.
+
+### Manual SSH tunnel (advanced)
+
+If you prefer to manage the tunnel yourself:
+
+```bash
+# On the remote host
 ttyleport daemon &
-ttyleport new -t project
-# detach (Ctrl-C or close terminal)
-```
 
-**From your laptop**, forward the socket and attach:
-
-```bash
-# Get the remote socket path
+# From your laptop: get socket path, forward it, attach
 REMOTE_SOCK=$(ssh user@remote-host ttyleport socket-path)
-
-# Forward the remote daemon socket to a local path
-ssh -L /tmp/ttyleport-remote.sock:$REMOTE_SOCK user@remote-host -N &
-
-# Attach to the remote session via the forwarded socket
-ttyleport --ctl-socket /tmp/ttyleport-remote.sock attach -t project
-```
-
-Close your laptop, switch networks, reconnect SSH — the client detects the dead connection and auto-reconnects when the tunnel is back.
-
-**Tip:** Use [autossh](https://www.harding.motd.ca/autossh/) to keep the SSH tunnel alive automatically:
-
-```bash
-AUTOSSH_GATETIME=0 \
-autossh -M 0 \
+ssh -N -T -L /tmp/ttyleport-remote.sock:$REMOTE_SOCK \
   -o ServerAliveInterval=3 -o ServerAliveCountMax=2 \
   -o StreamLocalBindUnlink=yes \
   -o ExitOnForwardFailure=yes \
-  -o ConnectTimeout=5 \
-  -N -T \
-  -L /tmp/ttyleport-remote.sock:$REMOTE_SOCK \
-  user@remote-host
+  user@remote-host &
+ttyleport --ctl-socket /tmp/ttyleport-remote.sock attach -t project
 ```
-
-`ServerAliveInterval=3` and `ServerAliveCountMax=2` detect a dead connection in 6 seconds — well under ttyleport's 15-second heartbeat timeout, so most network blips heal transparently. `StreamLocalBindUnlink=yes` removes the stale socket on reconnect so the new tunnel can bind. `AUTOSSH_GATETIME=0` retries immediately on failure.
 
 ## Commands
 
@@ -89,15 +87,21 @@ autossh -M 0 \
 |---------|---------|-------------|
 | `ttyleport daemon` | `d` | Start the daemon (foreground) |
 | `ttyleport new-session` | `new` | Create a session and auto-attach |
-| `ttyleport attach -t <id\|name>` | `a`, `connect` | Attach to a session (detaches other clients) |
+| `ttyleport attach -t <id\|name>` | `a` | Attach to a session (detaches other clients) |
+| `ttyleport connect user@host` | `c` | Connect to remote host via SSH tunnel |
 | `ttyleport list-sessions` | `ls`, `list` | List active sessions |
 | `ttyleport kill-session -t <id\|name>` | | Kill a session |
 | `ttyleport kill-server` | | Kill the daemon and all sessions |
 | `ttyleport socket-path` | `socket` | Print the default socket path |
 
 **Options:**
-- `-t <name>` on `new-session`: give the session a human-friendly name
-- `--no-redraw` on `attach`: skip sending Ctrl-L after attaching
+- `-t <name>` on `new-session`/`attach`/`connect`: session name
+- `--new` on `connect`: force create (error if name exists)
+- `--ls` on `connect`: list remote sessions and exit
+- `--no-daemon-start` on `connect`: don't auto-start remote daemon
+- `-o <option>` on `connect`: extra SSH options (repeatable)
+- `--no-redraw` on `attach`/`connect`: skip Ctrl-L redraw after attaching
+- `--no-escape` on `new-session`/`attach`/`connect`: disable `~` escape sequences
 - `--ctl-socket <path>` (global): override the daemon socket path
 
 ## How it works
@@ -114,8 +118,6 @@ Early stage. Works on Linux. Not yet packaged for distribution.
 
 ## Roadmap
 
-- **SSH wrapper** — `ttyleport connect user@host` that handles socket forwarding, remote daemon startup, and attach in one command
-- **Detach key** — configurable key sequence (e.g. `~.`) to cleanly detach from a session without killing the client
 - **Daemon auto-start** — start the daemon on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** — daemon re-execs itself with a new binary, preserving sessions and child processes across upgrades
 - **Read-only attach** — multiple clients viewing the same session for pair programming or demos
