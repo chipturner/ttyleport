@@ -57,9 +57,8 @@ gritty kill-server
 `gritty ls` output:
 
 ```
-ID  Name   PTY         PID    Created              Attached  Last Heartbeat
-0   work   /dev/pts/4  48291  2026-02-21 14:32:07  yes       2026-02-21 14:35:12
-1   logs   /dev/pts/5  48305  2026-02-21 14:33:41  no        2026-02-21 14:34:02
+0: work /dev/pts/4 (pid 48291) (attached, heartbeat 3s ago)
+1: logs /dev/pts/5 (pid 48305) (detached)
 ```
 
 ## Remote Usage via SSH
@@ -71,9 +70,10 @@ The real value of gritty is remote sessions that survive network interruptions.
 ```bash
 # Terminal 1: start the tunnel (stays running)
 gritty connect user@remote-host
-# Prints: Socket available at /run/user/1000/gritty/connect-12345.sock
-#         Use: gritty new --ctl-socket /run/user/1000/gritty/connect-12345.sock
-#         Or:  gritty attach -t <name> --ctl-socket /run/user/1000/gritty/connect-12345.sock
+# stdout: /run/user/1000/gritty/connect-12345.sock
+# stderr: tunnel ready. to use:
+#           gritty new --ctl-socket /run/user/1000/gritty/connect-12345.sock
+#           gritty attach -t <name> --ctl-socket /run/user/1000/gritty/connect-12345.sock
 
 # Terminal 2: create a session through the tunnel
 gritty new -t project --ctl-socket /run/user/1000/gritty/connect-12345.sock
